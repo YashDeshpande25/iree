@@ -370,6 +370,7 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
   } else {
     // TODO (nirvedhmeshram, Max191, jerryyin) : Add support so that unaligned
     // shapes do not require c promotion.
+    // GPU::appendPromotedOperandsList(context, attrs, {0, 1, 2});
     GPU::appendPromotedOperandsList(context, attrs, {0, 1});
     SmallVector<int64_t> paddingTileSizes = workgroupTileSizes;
 
