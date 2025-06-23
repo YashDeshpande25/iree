@@ -66,10 +66,13 @@ typedef uint64_t uintptr_t;
 
 #define IREE_AMDGPU_RESTRICT __restrict__
 #define IREE_AMDGPU_ALIGNAS(x) __attribute__((aligned(x)))
+#define IREE_AMDGPU_ALIGNOF(x) __alignof__(x)
 
 #define IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE __attribute__((always_inline))
 #define IREE_AMDGPU_ATTRIBUTE_SINGLE_WORK_ITEM
 #define IREE_AMDGPU_ATTRIBUTE_PACKED __attribute__((__packed__))
+
+#define IREE_AMDGPU_ATTRIBUTE_MUSTTAIL [[clang::musttail]]
 
 #define IREE_AMDGPU_ATTRIBUTE_KERNEL \
   [[clang::amdgpu_kernel, gnu::visibility("protected")]]
@@ -83,6 +86,7 @@ typedef uint64_t uintptr_t;
 
 #define IREE_AMDGPU_RESTRICT IREE_RESTRICT
 #define IREE_AMDGPU_ALIGNAS(x) iree_alignas(x)
+#define IREE_AMDGPU_ALIGNOF(x) iree_alignof(x)
 
 #define IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE IREE_ATTRIBUTE_ALWAYS_INLINE
 #define IREE_AMDGPU_ATTRIBUTE_SINGLE_WORK_ITEM
@@ -111,9 +115,16 @@ typedef uint64_t uintptr_t;
 
 #define IREE_AMDGPU_CEIL_DIV(lhs, rhs) (((lhs) + (rhs) - 1) / (rhs))
 
+// Aligns |value| up to the given power-of-two |alignment| if required.
+// https://en.wikipedia.org/wiki/Data_structure_alignment#Computing_padding
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
 iree_amdgpu_align(size_t value, size_t alignment) {
   return (value + (alignment - 1)) & ~(alignment - 1);
+}
+
+// Returns true if |value| matches the given minimum |alignment|.
+static inline bool iree_amdgpu_has_alignment(size_t value, size_t alignment) {
+  return iree_amdgpu_align(value, alignment) == value;
 }
 
 // Returns true if any bit from |rhs| is set in |lhs|.
@@ -122,6 +133,8 @@ iree_amdgpu_align(size_t value, size_t alignment) {
 #define IREE_AMDGPU_ALL_BITS_SET(lhs, rhs) (((lhs) & (rhs)) == (rhs))
 
 #if defined(IREE_AMDGPU_TARGET_DEVICE)
+
+#define IREE_AMDGPU_OFFSETOF(type, field) __builtin_offsetof(type, field)
 
 // Returns the number of leading zeros in a 64-bit bitfield.
 // Returns -1 if no bits are set.
@@ -135,6 +148,8 @@ iree_amdgpu_align(size_t value, size_t alignment) {
 #define IREE_AMDGPU_LASTBIT_U64(v) ((v) == 0 ? -1 : __builtin_ctzl(v))
 
 #else
+
+#define IREE_AMDGPU_OFFSETOF(type, field) offsetof(type, field)
 
 #define IREE_AMDGPU_LASTBIT_U64(v) \
   ((v) == 0 ? -1 : iree_math_count_trailing_zeros_u64(v))

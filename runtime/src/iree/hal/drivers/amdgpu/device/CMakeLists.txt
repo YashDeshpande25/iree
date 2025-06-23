@@ -9,14 +9,21 @@
 #===------------------------------------------------------------------------===#
 
 set(_BITCODE_SRCS
+  "blit.c"
   "buffer.c"
-  "dummy.c"
+  "command_buffer.c"
+  "host_client.c"
+  "tracing.c"
 )
 
 set(_BITCODE_HDRS
+  "blit.h"
   "buffer.h"
+  "command_buffer.h"
   "kernel_tables.h"
   "kernels.h"
+  "host_client.h"
+  "tracing.h"
   "support/common.h"
   "support/kernel_args.h"
   "support/mutex.h"

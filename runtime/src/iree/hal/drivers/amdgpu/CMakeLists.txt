@@ -24,6 +24,8 @@ iree_cc_library(
     "buffer_pool.h"
     "channel.c"
     "channel.h"
+    "command_buffer.c"
+    "command_buffer.h"
     "driver.c"
     "driver.h"
     "event.c"
@@ -32,6 +34,8 @@ iree_cc_library(
     "executable.h"
     "executable_cache.c"
     "executable_cache.h"
+    "host_service.c"
+    "host_service.h"
     "logical_device.c"
     "logical_device.h"
     "physical_device.c"
@@ -66,10 +70,12 @@ iree_cc_library(
     "buffer.h"
     "buffer_pool.h"
     "channel.h"
+    "command_buffer.h"
     "driver.h"
     "event.h"
     "executable.h"
     "executable_cache.h"
+    "host_service.h"
     "logical_device.h"
     "physical_device.h"
     "system.h"
@@ -96,6 +102,25 @@ iree_cc_test(
     ::headers
     iree::base
     iree::hal::drivers::amdgpu::device::headers
+    iree::hal::drivers::amdgpu::util
+    iree::hal::drivers::amdgpu::util::libhsa
+    iree::hal::drivers::amdgpu::util::topology
+    iree::testing::gtest
+    iree::testing::gtest_main
+  LABELS
+    "driver=amdgpu"
+    "nodocker"
+)
+
+iree_cc_test(
+  NAME
+    host_service_test
+  SRCS
+    "host_service_test.cc"
+  DEPS
+    ::amdgpu
+    ::headers
+    iree::base
     iree::hal::drivers::amdgpu::util
     iree::hal::drivers::amdgpu::util::libhsa
     iree::hal::drivers::amdgpu::util::topology

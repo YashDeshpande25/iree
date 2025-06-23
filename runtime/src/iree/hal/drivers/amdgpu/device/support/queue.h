@@ -131,6 +131,66 @@ typedef struct IREE_AMDGPU_ALIGNAS(64) iree_amd_queue_t {
 } iree_amd_queue_t;
 
 //===----------------------------------------------------------------------===//
+// Cached HSA/AMD Queue
+//===----------------------------------------------------------------------===//
+
+// A variant of iree_hsa_queue_t/iree_amd_queue_t with all of the hot fields
+// hoisted into the struct. Queue metadata is immutable so it is always safe to
+// cache the fields and doing so allows us to avoid one indirection on every
+// access. Since queue metadata may live in either host or device memory it also
+// prevents the device from possibly needing to dereference the host-side
+// metadata in order to get the ringbuffer pointer or indices.
+//
+// NOTE: we try to keep this to the smallest possible set so that it can fit in
+// a single cache line. We want one fetch from local memory to get all the info
+// needed to start pushing writes.
+typedef IREE_AMDGPU_ALIGNAS(
+    iree_amdgpu_destructive_interference_size) struct iree_amd_cached_queue_t {
+  // Packet storage. Must be accessible on any agents that may operate on it and
+  // aligned to at least 64 (the size of an AQL packet).
+  void* base_address;
+
+  // Maximum number of packets the queue can hold. Must be a power of 2.
+  uint32_t size;
+
+  uint32_t reserved;
+
+  // Signal object used by the application to indicate the ID of a packet that
+  // is ready to be processed. The HSA runtime or hardware packet processor
+  // manages the doorbell signal. If the application tries to replace or destroy
+  // this signal the behavior is undefined.
+  iree_hsa_signal_t doorbell_signal;
+
+  // Pointer to the ringbuffer write dispatch ID atomic.
+  iree_amdgpu_scoped_atomic_uint64_t* write_dispatch_id;
+
+  // Pointer to the ringbuffer read dispatch ID atomic.
+  iree_amdgpu_scoped_atomic_uint64_t* read_dispatch_id;
+
+  // Backing queue that may live in host or device memory.
+  iree_amd_queue_t* queue;
+} iree_amd_cached_queue_t;
+
+// Returns an HSA queue reference with the important
+static inline iree_amd_cached_queue_t iree_amd_make_cached_queue(
+    iree_hsa_queue_t* queue) {
+  iree_amd_cached_queue_t result = {
+      /*.base_address=*/queue->base_address,
+      /*.size=*/queue->size,
+      /*.reserved=*/0u,
+      /*.doorbell_signal=*/{(uint64_t)&queue->doorbell_signal},
+      /*.write_dispatch_id=*/
+      (iree_amdgpu_scoped_atomic_uint64_t*)&((iree_amd_queue_t*)queue)
+          ->write_dispatch_id,
+      /*.read_dispatch_id=*/
+      (iree_amdgpu_scoped_atomic_uint64_t*)&((iree_amd_queue_t*)queue)
+          ->read_dispatch_id,
+      /*.queue=*/(iree_amd_queue_t*)queue,
+  };
+  return result;
+}
+
+//===----------------------------------------------------------------------===//
 // HSA/AMDGPU AQL Packets
 //===----------------------------------------------------------------------===//
 
@@ -477,7 +537,8 @@ typedef struct IREE_AMDGPU_ALIGNAS(8) iree_amdgpu_kernel_implicit_args_t {
   uint16_t group_size[3];  // + 12/14/16
 
   // Grid dispatch work group size of the partial work group, if it exists.
-  // Any dimension that does not exist must be 0.
+  // Any dimension that does not exist must be 0. Only used in OpenCL and can
+  // be 0.
   //
   // Represented in metadata as:
   //   hidden_remainder_x
@@ -489,6 +550,11 @@ typedef struct IREE_AMDGPU_ALIGNAS(8) iree_amdgpu_kernel_implicit_args_t {
   uint64_t reserved1;  // + 32
 
   // OpenCL grid dispatch global offset.
+  // Always 0 in HIP but still required as the device library functions for
+  // grid locations is shared with OpenCL and unconditionally factors it in.
+  //
+  // Hardcoded to 0 in HIP:
+  // https://github.com/ROCm/clr/blob/a2550e0a9ecaa8f371cb14d08904c51874c37cbe/hipamd/src/hip_module.cpp#L348
   //
   // Represented in metadata as:
   //   hidden_global_offset_x
@@ -499,10 +565,189 @@ typedef struct IREE_AMDGPU_ALIGNAS(8) iree_amdgpu_kernel_implicit_args_t {
   // Grid dispatch dimensionality. This is the same value as the AQL
   // dispatch packet dimensionality. Must be a value between 1 and 3.
   //
+  // Hardcoded to 3 in HIP:
+  // https://github.com/ROCm/clr/blob/a2550e0a9ecaa8f371cb14d08904c51874c37cbe/hipamd/src/hip_module.cpp#L349
+  //
   // Represented in metadata as:
   //   hidden_grid_dims
   uint16_t grid_dims;  // + 64
+
+  // Fixed-size buffer for `-mprintf-kind=buffered` support.
+  // By default LLVM uses `hostcall` but that's a mess and we avoid it.
+  // `__printf_alloc` in the device library is used to grab this pointer, the
+  // header DWORDs are manipulated, and the contents are written to the buffer.
+  //
+  // struct {
+  //   atomic_uint32_t offset;
+  //   uint32_t size;
+  //   uint8_t data[size];
+  // } printf_buffer_t;
+  //
+  // One of many disappointing parts of this scheme is that constant string
+  // values are interned, MD5 hashed, and stored *externally* in the amdhsa data
+  // blob. In order to print with any constant format string this data blob
+  // needs to be parsed, retained, and referenced every time a printf packet is
+  // processed. It would have been significantly better to embed the table in
+  // the ELF as a global constant instead as then we could reference it on both
+  // host and device and not need to parse the amdhsa blob.
+  //
+  // The contents of the data buffer are best defined by the janky parser code:
+  // https://github.com/ROCm/clr/blob/a2550e0a9ecaa8f371cb14d08904c51874c37cbe/rocclr/device/rocm/rocprintf.cpp#L454
+  // Each printf consists of a control DWORD followed by 8-byte aligned
+  // contents. Effectively:
+  // struct {
+  //   uint32_t is_stderr : 1;       // else stdout
+  //   uint32_t constant : 1;        // constant format string code path
+  //   uint32_t size_in_bytes : 30;  // (including this header)
+  //   uint64_t data[size_in_bytes / 8];
+  // } printf_packet_t;
+  //
+  // To construct the full format data buffer if constant == 1:
+  //  data[0] contains the lower 64-bits of the MD5 hash of the string followed
+  //  by size_in_bytes-12 arguments. The data buffer needs to be expanded into
+  //  an 8-byte aligned NUL-terminated string with the corresponding hash
+  //  followed by the arguments verbatim. Once reconstituted the subsequent
+  //  logic is the same.
+  //
+  // The data buffer is an 8-byte aligned NUL-terminated string followed by
+  // the argument data. E.g. `hi! %s` would be encoded as `hi! %s` 0x00 0x??
+  // (with the last byte being padding to an 8-byte boundary). The reference
+  // code for formatting the string lives in the CLR:
+  // https://github.com/ROCm/clr/blob/a2550e0a9ecaa8f371cb14d08904c51874c37cbe/rocclr/device/devhcprintf.cpp#L168
+  // Note that the documentation is incorrect about there being a version prefix
+  // and it expects the first uint64_t to contain the format string bytes.
+  //
+  // Note that in another disappointing display of rube-goldbergian development
+  // this implementation for some reason uses uint64_t for its data elements
+  // but never aligns it - meaning that consumer code must use unaligned loads
+  // in order to read the data. The CLR just copies it out each time. One could
+  // think that was for streaming (release the buffer contents early back to
+  // dispatches) but since they fully halt the world and synchronize after every
+  // dispatch containing a print none of that matters and it's just poor
+  // engineering.
+  //
+  // The compiler emits strings in the delimited form of
+  // `"0:0:<format_string_hash>,<actual_format_string>"`. Note that the first
+  // two values should always be 0 and are delimited by `:` while the MD5 hash
+  // is delimited from the format string itself by `,`. There's some special
+  // handling in the CLR for `:` being in the format string because whoever
+  // wrote it did a find from the end instead of a prefix consume - there's
+  // special handling of \72 (`:`) and other weird things that I'm not sure is
+  // needed. Example from LLVM: `"0:0:8addc4c0362218ac,Hello World!:\n"`.
+  //
+  // The hash is the lower 64 bits of the MD5 hash in hex but we don't care as
+  // it's just a semi-unique value we use to lookup the string formats. On load
+  // we sort and do a binary search instead of creating an std::map for every
+  // single print invocation like the CLR does. Just... wow.
+  //
+  // Handling the contents is also overtly complicated and poorly documented:
+  // https://github.com/ROCm/clr/blob/a2550e0a9ecaa8f371cb14d08904c51874c37cbe/rocclr/device/devhcprintf.cpp#L168
+  //
+  // See:
+  // https://github.com/ROCm/llvm-project/commit/631c965483e03355cdc1dba578e787b259c4d79d
+  // https://github.com/ROCm/llvm-project/blob/997363823fcc5ccc7b0cc572aad05ba08714bf5f/amd/device-libs/ockl/src/cprintf.cl#L17
+  // https://github.com/ROCm/clr/blob/a2550e0a9ecaa8f371cb14d08904c51874c37cbe/rocclr/device/rocm/rocprintf.cpp#L393
+  //
+  // Note that having a printf in a kernel causes the kernel to dispatch
+  // synchronously :facepalm:. We can't do the same and would need to emit
+  // flush packets (or something) into the control queue. What a mess.
+  // https://github.com/ROCm/clr/blob/a2550e0a9ecaa8f371cb14d08904c51874c37cbe/rocclr/device/rocm/rocvirtual.cpp#L3644
+  // https://github.com/ROCm/clr/blob/a2550e0a9ecaa8f371cb14d08904c51874c37cbe/rocclr/device/rocm/rocprintf.cpp#L428-L429
+  //
+  // Represented in metadata as:
+  //   hidden_printf_buffer
+  void* printf_buffer;  // + 72
+
+  // Used for ASAN, printf, and more modern device memory allocations.
+  // It's bizarre and only "documented" in code and I really hope we don't have
+  // to touch it. Note that due to some LLVM bug sometimes this will be included
+  // in the offset table for a kernel even if it is not used (the
+  // `amdgpu-no-hostcall-ptr` attribute is set). At this point I'm quite sure no
+  // one has ever actually inspected the files produced by the LLVM backend.
+  //
+  // Represented in metadata as:
+  //   hidden_hostcall_buffer
+  void* hostcall_buffer;  // + 80
+
+  // Multi-grid support was deprecated in ROCM 5.x and should never appear in
+  // any program we generate ourselves or care about running.
+  //
+  // Represented in metadata as:
+  //   hidden_multigrid_sync_arg
+  uint64_t deprecated_multigrid_sync_arg;
+
+  // Device memory heap pointer for device malloc/free.
+  // We don't support kernels using this as it requires too much goo for little
+  // payoff. The kernels we run shouldn't be malloc/freeing internally. If they
+  // do we will need to implement the heap API via hostcalls and other silly
+  // things that add a tremendous amount of complexity.
+  //
+  // See:
+  // https://github.com/ROCm/llvm-project/blob/97753eeaa4c79c2db2dcd9f37b7989596a8d4f15/amd/device-libs/ockl/src/dm.cl#L192
+  //
+  // Represented in metadata as:
+  //   hidden_heap_v1
+  uint64_t unused_heap_v1;
+
+  // AQL queue handles are only used by OpenCL device-side enqueue and we do not
+  // support that. We could, probably, by passing in our execution queue but
+  // since HIP has never supported it the use case doesn't exist. If we wanted
+  // to support device-enqueue we'd do it in a structured fashion instead of
+  // letting kernels splat right into the AQL queue.
+  //
+  // See:
+  // https://github.com/ROCm/llvm-project/blob/97753eeaa4c79c2db2dcd9f37b7989596a8d4f15/amd/device-libs/opencl/src/devenq/enqueue.cl#L310
+  //
+  // Represented in metadata as:
+  //   hidden_default_queue
+  uint64_t unused_default_queue;
+
+  // Completion actions were (I believe) an attempt at dynamic parallelism and
+  // HIP has never supported them. Device-side enqueue in OpenCL uses this but
+  // we don't support those kernels.
+  //
+  // See:
+  // https://github.com/ROCm/llvm-project/blob/97753eeaa4c79c2db2dcd9f37b7989596a8d4f15/amd/device-libs/opencl/src/devenq/enqueue.cl#L311
+  //
+  // Represented in metadata as:
+  //   hidden_completion_action
+  uint64_t unused_completion_action;
+
+  // The value of the sharedMemBytes parameter to the dispatch indicating how
+  // much dynamic shared memory was reserved for the kernel. This may be larger
+  // than the requested amount. The total group_segment_size for a dispatch is
+  // the static LDS requirement of the kernel plus this value.
+  //
+  // Represented in metadata as:
+  //   hidden_dynamic_lds_size
+  uint32_t dynamic_lds_size;
+
+  uint8_t reserved[68];
+
+  // Only used by GFX8, which we don't support.
+  //
+  // Represented in metadata as:
+  //   hidden_private_base
+  uint32_t deprecated_private_base;
+
+  // Only used by GFX8, which we don't support.
+  //
+  // Represented in metadata as:
+  //   hidden_shared_base
+  uint32_t deprecated_shared_base;
+
+  // AQL queue the dispatch is running on.
+  // Only used by pre-GFX9 devices, which we don't support.
+  //
+  // Represented in metadata as:
+  //   hidden_queue_ptr;
+  iree_hsa_queue_t* deprecated_queue_ptr;
 } iree_amdgpu_kernel_implicit_args_t;
+
+#define IREE_AMDGPU_KERNEL_IMPLICIT_ARGS_SIZE               \
+  (IREE_AMDGPU_OFFSETOF(iree_amdgpu_kernel_implicit_args_t, \
+                        dynamic_lds_size) +                 \
+   sizeof(((iree_amdgpu_kernel_implicit_args_t*)NULL)->dynamic_lds_size))
 
 //===----------------------------------------------------------------------===//
 // OpenCL/HIP Dispatch ABI
@@ -530,9 +775,25 @@ iree_hal_amdgpu_device_global_id_x(void) {
   const uint32_t group_size = iree_amdgcn_dispatch_ptr()->workgroup_size[0];
   return (group_id * group_size + local_id);
 }
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_global_id_y(void) {
+  const uint32_t local_id = __builtin_amdgcn_workitem_id_y();
+  const uint32_t group_id = __builtin_amdgcn_workgroup_id_y();
+  const uint32_t group_size = iree_amdgcn_dispatch_ptr()->workgroup_size[1];
+  return (group_id * group_size + local_id);
+}
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_global_id_z(void) {
+  const uint32_t local_id = __builtin_amdgcn_workitem_id_z();
+  const uint32_t group_id = __builtin_amdgcn_workgroup_id_z();
+  const uint32_t group_size = iree_amdgcn_dispatch_ptr()->workgroup_size[2];
+  return (group_id * group_size + local_id);
+}
 
 // __ockl_get_group_id(0)
 #define iree_hal_amdgpu_device_group_id_x() __builtin_amdgcn_workgroup_id_x()
+#define iree_hal_amdgpu_device_group_id_y() __builtin_amdgcn_workgroup_id_y()
+#define iree_hal_amdgpu_device_group_id_z() __builtin_amdgcn_workgroup_id_z()
 
 // __ockl_get_num_groups(0)
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
@@ -542,9 +803,25 @@ iree_hal_amdgpu_device_group_count_x(void) {
   const uint32_t q = grid_size / group_size;
   return q + (grid_size > q * group_size);
 }
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_group_count_y(void) {
+  const uint32_t grid_size = iree_amdgcn_dispatch_ptr()->grid_size[1];
+  const uint32_t group_size = iree_amdgcn_dispatch_ptr()->workgroup_size[1];
+  const uint32_t q = grid_size / group_size;
+  return q + (grid_size > q * group_size);
+}
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_group_count_z(void) {
+  const uint32_t grid_size = iree_amdgcn_dispatch_ptr()->grid_size[2];
+  const uint32_t group_size = iree_amdgcn_dispatch_ptr()->workgroup_size[2];
+  const uint32_t q = grid_size / group_size;
+  return q + (grid_size > q * group_size);
+}
 
 // __ockl_get_local_id(0)
 #define iree_hal_amdgpu_device_local_id_x() __builtin_amdgcn_workitem_id_x()
+#define iree_hal_amdgpu_device_local_id_y() __builtin_amdgcn_workitem_id_y()
+#define iree_hal_amdgpu_device_local_id_z() __builtin_amdgcn_workitem_id_z()
 
 // __ockl_get_local_size(0) / get_local_size_x
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
@@ -554,6 +831,56 @@ iree_hal_amdgpu_device_workgroup_size_x(void) {
   const uint32_t grid_size = iree_amdgcn_dispatch_ptr()->grid_size[0];
   const uint32_t r = grid_size - group_id * group_size;
   return (r < group_size) ? r : group_size;
+}
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_workgroup_size_y(void) {
+  const uint32_t group_id = __builtin_amdgcn_workgroup_id_y();
+  const uint32_t group_size = iree_amdgcn_dispatch_ptr()->workgroup_size[1];
+  const uint32_t grid_size = iree_amdgcn_dispatch_ptr()->grid_size[1];
+  const uint32_t r = grid_size - group_id * group_size;
+  return (r < group_size) ? r : group_size;
+}
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_workgroup_size_z(void) {
+  const uint32_t group_id = __builtin_amdgcn_workgroup_id_z();
+  const uint32_t group_size = iree_amdgcn_dispatch_ptr()->workgroup_size[2];
+  const uint32_t grid_size = iree_amdgcn_dispatch_ptr()->grid_size[2];
+  const uint32_t r = grid_size - group_id * group_size;
+  return (r < group_size) ? r : group_size;
+}
+
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_global_linear_id_1d(void) {
+  return iree_hal_amdgpu_device_group_id_x() *
+             iree_amdgcn_dispatch_ptr()->workgroup_size[0] +
+         iree_hal_amdgpu_device_local_id_x();
+}
+
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_global_linear_id_2d(void) {
+  const size_t id_x = iree_hal_amdgpu_device_group_id_x() *
+                          iree_amdgcn_dispatch_ptr()->workgroup_size[0] +
+                      iree_hal_amdgpu_device_local_id_x();
+  const size_t id_y = iree_hal_amdgpu_device_group_id_y() *
+                          iree_amdgcn_dispatch_ptr()->workgroup_size[1] +
+                      iree_hal_amdgpu_device_local_id_y();
+  return id_y * iree_amdgcn_dispatch_ptr()->grid_size[0] + id_x;
+}
+
+static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE size_t
+iree_hal_amdgpu_device_global_linear_id_3d(void) {
+  const size_t id_x = iree_hal_amdgpu_device_group_id_x() *
+                          iree_amdgcn_dispatch_ptr()->workgroup_size[0] +
+                      iree_hal_amdgpu_device_local_id_x();
+  const size_t id_y = iree_hal_amdgpu_device_group_id_y() *
+                          iree_amdgcn_dispatch_ptr()->workgroup_size[1] +
+                      iree_hal_amdgpu_device_local_id_y();
+  const size_t id_z = iree_hal_amdgpu_device_group_id_z() *
+                          iree_amdgcn_dispatch_ptr()->workgroup_size[2] +
+                      iree_hal_amdgpu_device_local_id_z();
+  return (id_z * iree_amdgcn_dispatch_ptr()->grid_size[1] + id_y) *
+             iree_amdgcn_dispatch_ptr()->grid_size[0] +
+         id_x;
 }
 
 #endif  // IREE_AMDGPU_TARGET_DEVICE
@@ -568,66 +895,56 @@ iree_hal_amdgpu_device_workgroup_size_x(void) {
 #if defined(IREE_AMDGPU_TARGET_DEVICE)
 
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE uint64_t
-iree_hsa_queue_load_read_index(const iree_hsa_queue_t* IREE_AMDGPU_RESTRICT
-                                   queue,
-                               iree_amdgpu_memory_order_t memory_order) {
-  const iree_amd_queue_t* q = (const iree_amd_queue_t*)queue;
-  return iree_amdgpu_scoped_atomic_load(
-      (iree_amdgpu_scoped_atomic_uint64_t*)&q->read_dispatch_id, memory_order,
-      iree_amdgpu_memory_scope_system);
+iree_hsa_queue_load_read_index(
+    const iree_amd_cached_queue_t* IREE_AMDGPU_RESTRICT queue,
+    iree_amdgpu_memory_order_t memory_order) {
+  return iree_amdgpu_scoped_atomic_load(queue->read_dispatch_id, memory_order,
+                                        iree_amdgpu_memory_scope_system);
 }
 
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE void
-iree_hsa_queue_store_read_index(iree_hsa_queue_t* IREE_AMDGPU_RESTRICT queue,
-                                uint64_t value,
-                                iree_amdgpu_memory_order_t memory_order) {
-  iree_amd_queue_t* q = (iree_amd_queue_t*)queue;
-  iree_amdgpu_scoped_atomic_store(
-      (iree_amdgpu_scoped_atomic_uint64_t*)&q->read_dispatch_id, value,
-      memory_order, iree_amdgpu_memory_scope_system);
+iree_hsa_queue_store_read_index(
+    const iree_amd_cached_queue_t* IREE_AMDGPU_RESTRICT queue, uint64_t value,
+    iree_amdgpu_memory_order_t memory_order) {
+  iree_amdgpu_scoped_atomic_store(queue->read_dispatch_id, value, memory_order,
+                                  iree_amdgpu_memory_scope_system);
 }
 
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE uint64_t
-iree_hsa_queue_load_write_index(const iree_hsa_queue_t* IREE_AMDGPU_RESTRICT
-                                    queue,
-                                iree_amdgpu_memory_order_t memory_order) {
-  const iree_amd_queue_t* q = (const iree_amd_queue_t*)queue;
-  return iree_amdgpu_scoped_atomic_load(
-      (iree_amdgpu_scoped_atomic_uint64_t*)&q->write_dispatch_id, memory_order,
-      iree_amdgpu_memory_scope_system);
+iree_hsa_queue_load_write_index(
+    const iree_amd_cached_queue_t* IREE_AMDGPU_RESTRICT queue,
+    iree_amdgpu_memory_order_t memory_order) {
+  return iree_amdgpu_scoped_atomic_load(queue->write_dispatch_id, memory_order,
+                                        iree_amdgpu_memory_scope_system);
 }
 
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE uint64_t
-iree_hsa_queue_add_write_index(iree_hsa_queue_t* IREE_AMDGPU_RESTRICT queue,
-                               uint64_t value,
-                               iree_amdgpu_memory_order_t memory_order) {
-  iree_amd_queue_t* q = (iree_amd_queue_t*)queue;
-  return iree_amdgpu_scoped_atomic_fetch_add(
-      (iree_amdgpu_scoped_atomic_uint64_t*)&q->write_dispatch_id, value,
-      memory_order, iree_amdgpu_memory_scope_system);
+iree_hsa_queue_add_write_index(
+    const iree_amd_cached_queue_t* IREE_AMDGPU_RESTRICT queue, uint64_t value,
+    iree_amdgpu_memory_order_t memory_order) {
+  return iree_amdgpu_scoped_atomic_fetch_add(queue->write_dispatch_id, value,
+                                             memory_order,
+                                             iree_amdgpu_memory_scope_system);
 }
 
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE uint64_t
-iree_hsa_queue_cas_write_index(iree_hsa_queue_t* IREE_AMDGPU_RESTRICT queue,
-                               uint64_t expected, uint64_t value,
-                               iree_amdgpu_memory_order_t memory_order) {
-  iree_amd_queue_t* q = (iree_amd_queue_t*)queue;
+iree_hsa_queue_cas_write_index(
+    const iree_amd_cached_queue_t* IREE_AMDGPU_RESTRICT queue,
+    uint64_t expected, uint64_t value,
+    iree_amdgpu_memory_order_t memory_order) {
   uint64_t e = expected;
   iree_amdgpu_scoped_atomic_compare_exchange_strong(
-      (iree_amdgpu_scoped_atomic_uint64_t*)&q->write_dispatch_id, &e, value,
-      memory_order, iree_amdgpu_memory_order_relaxed,
-      iree_amdgpu_memory_scope_system);
+      queue->write_dispatch_id, &e, value, memory_order,
+      iree_amdgpu_memory_order_relaxed, iree_amdgpu_memory_scope_system);
   return e;
 }
 
 static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE void
-iree_hsa_queue_store_write_index(iree_hsa_queue_t* IREE_AMDGPU_RESTRICT queue,
-                                 uint64_t value,
-                                 iree_amdgpu_memory_order_t memory_order) {
-  iree_amd_queue_t* q = (iree_amd_queue_t*)queue;
-  iree_amdgpu_scoped_atomic_store(
-      (iree_amdgpu_scoped_atomic_uint64_t*)&q->write_dispatch_id, value,
-      memory_order, iree_amdgpu_memory_scope_system);
+iree_hsa_queue_store_write_index(
+    const iree_amd_cached_queue_t* IREE_AMDGPU_RESTRICT queue, uint64_t value,
+    iree_amdgpu_memory_order_t memory_order) {
+  iree_amdgpu_scoped_atomic_store(queue->write_dispatch_id, value, memory_order,
+                                  iree_amdgpu_memory_scope_system);
 }
 
 #endif  // IREE_AMDGPU_TARGET_DEVICE

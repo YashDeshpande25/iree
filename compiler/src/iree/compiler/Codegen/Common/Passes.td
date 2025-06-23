@@ -377,6 +377,11 @@ def FoldAffineMinInDistributedLoopsPass :
   let summary = "Fold `affine.min` ops in distributed loops";
 }
 
+def FoldReshapeIntoInterfaceTensorPass :
+    Pass<"iree-codegen-fold-reshape-into-interface-tensor", ""> {
+  let summary = "Folds reshape operations into the interface bindings.";
+}
+
 def FoldTensorExtractOpPass :
   Pass<"iree-codegen-fold-tensor-extract-op", ""> {
   let summary = "Fold `tensor.extract` operations prior to lowering to LLVM";
@@ -434,6 +439,9 @@ def GenericVectorizationPass :
     Option<"maxVectorSize", "max-vector-size", "int64_t",
             /*default=*/"2147483647",
            "Max vector size allowed to avoid creating large vectors.">
+  ];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect"
   ];
 }
 
