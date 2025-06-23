@@ -463,8 +463,8 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   }
 
   funcPassManager.addPass(createPropagateReshapesByExpansionPass());
-  funcPassManager.addPass(createBufferizeDispatchTensorLoadStorePass());
-  funcPassManager.addPass(createCombineLayoutTransformationPass());
+  // funcPassManager.addPass(createBufferizeDispatchTensorLoadStorePass());
+  // funcPassManager.addPass(createCombineLayoutTransformationPass());
   funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
 
@@ -509,7 +509,8 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   }
 
   // Step 5. Greedily fuse parallel loops and hoist from serial loops.
-  funcPassManager.addPass(createFoldLayoutTransformationPass());
+  funcPassManager.addPass(createCombineLayoutTransformationPass());
+  // funcPassManager.addPass(createFoldLayoutTransformationPass());
   funcPassManager.addPass(createGPUFuseAndHoistParallelLoopsPass());
   // funcPassManager.addPass(createFoldLayoutTransformationPass());
   funcPassManager.addPass(createGPUGreedilyDistributeToThreadsPass());

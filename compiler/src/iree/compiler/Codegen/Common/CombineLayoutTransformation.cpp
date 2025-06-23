@@ -385,6 +385,36 @@ combineRelayoutOpChain(RewriterBase &rewriter, MapScatterOp mapScatterOp,
 }
 
 static MapScatterOp
+// void
+insertIdentityMapScatter(RewriterBase &rewriter,
+                         tensor::ParallelInsertSliceOp parallelinsertsliceop, scf::ForallOp forallOp) {
+  // Get the source location
+  Location loc = parallelinsertsliceop->getLoc();
+
+  // To insert new ops before the parallel-slice-op such that the result of the new
+  // op will be used by the parallel_insert_slice_op
+  OpBuilder::InsertionGuard g(rewriter);
+  // rewriter.setInsertionPoint(parallelinsertsliceop);
+  rewriter.setInsertionPoint(forallOp.getTerminator());
+
+  // create an empty tensor to store the result of the map_scatter
+   Value source = parallelinsertsliceop.getSource();
+   Type bf16Type = rewriter.getBF16Type();
+  auto mapScatterDest =
+      rewriter
+          .create<tensor::EmptyOp>(
+              loc, tensor::getMixedSizes(rewriter, loc, source), bf16Type)
+          .getResult();
+  auto mapScatterOp = MapScatterOp::createIdentityMapScatter(
+      rewriter, loc, source, mapScatterDest);
+  rewriter.modifyOpInPlace(parallelinsertsliceop, [&]() {
+    parallelinsertsliceop.getSourceMutable().assign(mapScatterOp.getResult(0));
+  });
+  LDBG("Created identity map_scatter:\n" << mapScatterOp);
+  return mapScatterOp;
+}
+
+static MapScatterOp
 insertIdentityMapScatter(RewriterBase &rewriter,
                          IREE::Codegen::StoreToBufferOp storeOp) {
   Location loc = storeOp->getLoc();
@@ -468,6 +498,47 @@ combineLayoutTransformation(MLIRContext *ctx, FunctionOpInterface funcOp,
 
   // Start from iree_codegen.store_to_buffer ops, and combine producer
   // relayout ops into a single map_scatter.
+  
+  // ########################################################
+  // llvm::dbgs() << "Hello World \n";
+
+  // // get all the forall ops from a funcOp
+  // auto forAllOps = funcOp.getFunctionBody().getOps<scf::ForallOp>();
+
+  // // checking that a forall op has a workgroup mapping
+  // WalkResult walkResult = funcOp->walk([&](scf::ForallOp forallOp) {
+  // bool hasWorkgroupMapping =
+  //         llvm::any_of(forallOp.getMapping().value(),
+  //                      llvm::IsaPred<IREE::Codegen::WorkgroupMappingAttr>);
+
+  // if(hasWorkgroupMapping)
+  // {
+  //   llvm::dbgs()<<"This forall op has workgroup mapping\n";
+    
+  //   // get the tensor.parallel_insert_slice op from a forall op
+  //   scf::ForallOp forallOp;
+  //   SmallVector<Operation *> parallelInsertOps = forallOp.getCombiningOps(
+  //     forallOp.getRegionIterArgs()[1]);
+  //   // if (parallelInsertOps.size() == 1) {
+  //   //   llvm::dbgs() << "Found the parallel_insert_op \n";
+  //   // }
+  // }
+  // else
+  // {
+  //   llvm::dbgs()<<"This forall op does NOT have workgroup mapping\n";
+  // }
+  // return WalkResult::advance();
+  // });
+
+  // if (walkResult.wasInterrupted())
+  //     llvm::dbgs()<<"walk was interrupted\n";
+
+  
+
+  // auto parallelInsertOp =
+  //     dyn_cast<tensor::ParallelInsertSliceOp>(parallelInsertOps.front());
+
+  // ########################################################
   SmallVector<IREE::Codegen::StoreToBufferOp> dispatchResults(
       funcOp.getFunctionBody().getOps<IREE::Codegen::StoreToBufferOp>());
   for (IREE::Codegen::StoreToBufferOp dispatchResult : dispatchResults) {
@@ -475,6 +546,47 @@ combineLayoutTransformation(MLIRContext *ctx, FunctionOpInterface funcOp,
         insertIdentityMapScatter(rewriter, dispatchResult);
     combineRelayoutOpChain(rewriter, mapScatterOp, padDistributionConfigFn);
   }
+
+  // ################################################################
+    llvm::dbgs() << "Debug\n";
+
+    // auto forAllOps = funcOp.getFunctionBody().getOps<scf::ForallOp>();
+
+    WalkResult walkResult = funcOp->walk([&](scf::ForallOp forallOp) {
+    bool hasWorkgroupMapping =
+            llvm::any_of(forallOp.getMapping().value(),
+                        llvm::IsaPred<IREE::Codegen::WorkgroupMappingAttr>);
+
+    if(hasWorkgroupMapping)
+    {
+      llvm::dbgs()<<"This forall op has workgroup mapping\n";
+
+      SmallVector<Operation *> parallelInsertOps = forallOp.getCombiningOps(
+      // SmallVector<tensor::ParallelInsertSliceOp> parallelInsertOps = forallOp.getCombiningOps(
+        
+      forallOp.getRegionIterArgs()[0]);
+      llvm::dbgs()<<"Number of parallelinsertOps = "<<parallelInsertOps.size()<<"\n";
+      auto parallelInsertOp =
+      dyn_cast<tensor::ParallelInsertSliceOp>(parallelInsertOps.front());
+      // for (Operation * parallelInsertOp : parallelInsertOps) {
+      MapScatterOp mapScatterOp =
+          insertIdentityMapScatter(rewriter, parallelInsertOp, forallOp);
+          // SmallVector<DistributionConfig> distConfigs; // = padDistributionConfigFn(
+      //padOp.getSourceType().getShape(), rewriter.getContext());
+      // combineRelayoutOpChain(rewriter, mapScatterOp, defaultPadWorkgroupDistributionConfigFn);
+      combineRelayoutOpChain(rewriter, mapScatterOp, padDistributionConfigFn);
+    }
+    
+    else
+    {
+      llvm::dbgs()<<"This forall op does NOT have workgroup mapping\n";
+    }
+    return WalkResult::advance();
+    });
+
+    if (walkResult.wasInterrupted())
+        llvm::dbgs()<<"walk was interrupted\n";
+    // ################################################################
 
   // Cleanup any tensor.dim ops that may be present after relayout
   // combination.
@@ -540,6 +652,48 @@ struct FoldLayoutTransformationPass final
     // Apply some preprocessing to convert complex layout transformation
     // ops like pack and unpack into simpler supported ops.
     IRRewriter rewriter(&getContext());
+    // simplifyComplexRelayoutOps(rewriter, funcOp);
+
+    // ################################################################
+    llvm::dbgs() << "Debug\n";
+
+    // auto forAllOps = funcOp.getFunctionBody().getOps<scf::ForallOp>();
+
+    WalkResult walkResult = funcOp->walk([&](scf::ForallOp forallOp) {
+    bool hasWorkgroupMapping =
+            llvm::any_of(forallOp.getMapping().value(),
+                        llvm::IsaPred<IREE::Codegen::WorkgroupMappingAttr>);
+
+    if(hasWorkgroupMapping)
+    {
+      llvm::dbgs()<<"This forall op has workgroup mapping\n";
+
+      SmallVector<Operation *> parallelInsertOps = forallOp.getCombiningOps(
+      // SmallVector<tensor::ParallelInsertSliceOp> parallelInsertOps = forallOp.getCombiningOps(
+        
+      forallOp.getRegionIterArgs()[0]);
+      llvm::dbgs()<<"Number of parallelinsertOps = "<<parallelInsertOps.size()<<"\n";
+      auto parallelInsertOp =
+      dyn_cast<tensor::ParallelInsertSliceOp>(parallelInsertOps.front());
+      // for (Operation * parallelInsertOp : parallelInsertOps) {
+      MapScatterOp mapScatterOp =
+          insertIdentityMapScatter(rewriter, parallelInsertOp, forallOp);
+          // SmallVector<DistributionConfig> distConfigs; // = padDistributionConfigFn(
+      //padOp.getSourceType().getShape(), rewriter.getContext());
+      combineRelayoutOpChain(rewriter, mapScatterOp, defaultPadWorkgroupDistributionConfigFn);
+    }
+    
+    else
+    {
+      llvm::dbgs()<<"This forall op does NOT have workgroup mapping\n";
+    }
+    return WalkResult::advance();
+    });
+
+    if (walkResult.wasInterrupted())
+        llvm::dbgs()<<"walk was interrupted\n";
+    // ################################################################
+
     simplifyComplexRelayoutOps(rewriter, funcOp);
 
     // Start from iree_codegen.store_to_memref ops, and combine producer
@@ -551,6 +705,7 @@ struct FoldLayoutTransformationPass final
     for (IREE::LinalgExt::MapScatterOp mapScatterOp : mapScatterOps) {
       combineRelayoutOpChain(rewriter, mapScatterOp, defaultPadWorkgroupDistributionConfigFn);
     }
+    llvm::dbgs() << "Hello World \n";
 
     // Cleanup any tensor.dim ops that may be present after relayout
     // combination.
