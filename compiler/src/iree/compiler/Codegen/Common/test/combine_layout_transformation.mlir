@@ -272,3 +272,186 @@ func.func @propagate_relayout_ops(%source : tensor<?x?x128x128xf32>,
 //  CHECK-SAME:     outs(%[[INIT]] : tensor<?x?x128x128xf16>)
 //       CHECK:   %[[MAP_SCATTER:.+]] = iree_linalg_ext.map_scatter %[[COMPUTE_OP]]
 //       CHECK:   iree_codegen.store_to_buffer %[[MAP_SCATTER]]
+
+
+// -----
+
+// #####################################################################
+func.func @check_workgroup_mapping(%2 : tensor<196608x35xbf16>, %9 : tensor<8x16x1x16xbf16>) -> tensor<196608x35xbf16>{
+  // %cst = arith.constant 0.000000e+00 : bf16
+  // %c0 = arith.constant 0 : index
+  // %2 = hal.interface.binding.subspan layout(<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) binding(2) alignment(64) offset(%c0) flags(Indirect) {iree_gpu.use_rocdl_buffer_instructions} : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<196608x35xbf16>>
+  
+  // %5 = tensor.empty() : tensor<196608x35xbf16>
+  %6 = scf.forall (%arg0, %arg1) = (0, 0) to (196608, 35) step (128, 16) shared_outs(%arg2 = %2) -> (tensor<196608x35xbf16>) {
+    // %7 = affine.min affine_map<(d0) -> (-d0 + 35, 16)>(%arg1)
+    
+    // %8 = tensor.empty() : tensor<8x16x1x16xbf16>
+    // %9 = linalg.fill ins(%cst : bf16) outs(%8 : tensor<8x16x1x16xbf16>) -> tensor<8x16x1x16xbf16>
+
+    // %13 = tensor.empty() : tensor<8x16x1x16xbf16>
+    // %extracted_slice = tensor.extract_slice %arg2[%arg0, %arg1] [128, %7] [1, 1] : tensor<196608x35xbf16> to tensor<128x?xbf16>
+    // %transposed = linalg.transpose ins(%9 : tensor<8x1x16x16xbf16>) outs(%13 : tensor<8x16x1x16xbf16>) permutation = [0, 2, 1, 3] 
+    %collapsed = tensor.collapse_shape %9 [[0, 1], [2, 3]] : tensor<8x16x1x16xbf16> into tensor<128x16xbf16>
+    // %extracted_slice_1 = tensor.extract_slice %collapsed[0, 0] [128, %7] [1, 1] : tensor<128x16xbf16> to tensor<128x?xbf16>
+    // %14 = linalg.copy ins(%extracted_slice_1 : tensor<128x?xbf16>) outs(%extracted_slice : tensor<128x?xbf16>) -> tensor<128x?xbf16>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %collapsed into %arg2[%arg0, %arg1] [128, 16] [1, 1] : tensor<128x16xbf16> into tensor<196608x35xbf16>
+    }
+  } {mapping = [#iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}
+  // {mapping = [#gpu.thread<linear_dim_1>, #gpu.thread<linear_dim_0>]}
+  // scf.forall (%arg0, %arg1) = (%0, %1) to (%2, %3) step(%4, %5) {
+  //         "use"(%arg0, %arg1) : (index, index) -> ()
+  //         %collapsed = tensor.collapse_shape %transposed [[0, 1], [2, 3]] : tensor<8x16x1x16xbf16> into tensor<128x16xbf16>
+  //         scf.forall.in_parallel {}
+  //       } {mapping = [#iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}
+  // iree_tensor_ext.dispatch.tensor.store %6, %2, offsets = [0, 0], sizes = [196608, 35], strides = [1, 1] : tensor<196608x35xbf16> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<196608x35xbf16>>
+  return %6 : tensor<196608x35xbf16>
+}
+
+// CHECK-LABEL: @check_workgroup_mapping
+//       CHECK:   %[[MAP_SCATTER:.+]] = iree_linalg_ext.map_scatter
+//       CHECK:        } {mapping = [#iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}
+
+// -----
+
+// Test to look at an scf.forall op & not insert map_scatter as it is not a workgroup mapping
+func.func @check_no_workgroup_mapping(%3: tensor<64x64xf32>, %4: tensor<64x64xf32>, %5: tensor<64x64xf32>) -> tensor<64x64xf32>
+    attributes {
+      translation_info = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [64, 1, 1] subgroup_size = 64, {}>
+    } {
+  %c8 = arith.constant 8 : index
+  %c64 = arith.constant 64 : index
+  %c0 = arith.constant 0 : index
+  %6 = scf.for %arg0 = %c0 to %c64 step %c8 iter_args(%arg1 = %5) -> (tensor<64x64xf32>) {
+    %extracted_slice = tensor.extract_slice %3[0, %arg0] [64, 8] [1, 1] : tensor<64x64xf32> to tensor<64x8xf32>
+    %extracted_slice_0 = tensor.extract_slice %4[0, %arg0] [64, 8] [1, 1] : tensor<64x64xf32> to tensor<64x8xf32>
+    %extracted_slice_1 = tensor.extract_slice %arg1[0, %arg0] [64, 8] [1, 1] : tensor<64x64xf32> to tensor<64x8xf32>
+    
+    %1 = scf.forall (%arg5, %arg6) = (0, 0) to (64, 8) step (1, 4) shared_outs(%arg7 = %extracted_slice_1) -> (tensor<64x8xf32>) {
+      %extracted_slice_2 = tensor.extract_slice %extracted_slice[%arg5, %arg6] [1, 4] [1, 1] : tensor<64x8xf32> to tensor<1x4xf32>
+      %extracted_slice_3 = tensor.extract_slice %extracted_slice_0[%arg5, %arg6] [1, 4] [1, 1] : tensor<64x8xf32> to tensor<1x4xf32>
+      %extracted_slice_4 = tensor.extract_slice %arg7[%arg5, %arg6] [1, 4] [1, 1] : tensor<64x8xf32> to tensor<1x4xf32>
+      %2 = linalg.add ins(%extracted_slice_2, %extracted_slice_3 : tensor<1x4xf32>, tensor<1x4xf32>) outs(%extracted_slice_4 : tensor<1x4xf32>) -> tensor<1x4xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %2 into %arg7[%arg5, %arg6] [1, 4] [1, 1] : tensor<1x4xf32> into tensor<64x8xf32>
+      }
+    } {mapping = [#gpu.thread<linear_dim_1>, #gpu.thread<linear_dim_0>]}
+    %7 = linalg.add
+      ins(%1, %1 : tensor<64x8xf32>, tensor<64x8xf32>)
+      outs(%1 : tensor<64x8xf32>) -> tensor<64x8xf32>
+    %insert = tensor.insert_slice %7 into %arg1[0, %arg0] [64, 8] [1, 1] : tensor<64x8xf32> into tensor<64x64xf32>
+    scf.yield %insert : tensor<64x64xf32>
+  }
+  // %8 = linalg.add
+  //   ins(%6, %6 : tensor<64x64xf32>, tensor<64x64xf32>)
+  //   outs(%6 : tensor<64x64xf32>) -> tensor<64x64xf32>
+  // return %8 : tensor<64x64xf32>
+  return %6 : tensor<64x64xf32>
+}
+
+// CHECK-LABEL: @check_no_workgroup_mapping
+//   CHECK-NOT:   %[[MAP_SCATTER:.+]] = iree_linalg_ext.map_scatter
+//   CHECK-NOT:        } {mapping = [#iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}
+
+
+
+
+
+
+
+// func.func @check_no_work_groupmapping(){
+//   %21 = tensor.empty() : tensor<16x16xbf16>
+//   %22 = scf.forall (%arg5, %arg6) = (0, 0) to (16, 16) step (1, 2) shared_outs(%arg7 = %21) -> (tensor<16x16xbf16>) {
+//         %24 = affine.min affine_map<(d0, d1, d2) -> (16, d1 - d2, d0)>(%arg5, %7, %19)
+//         %25 = affine.min affine_map<(d0, d1) -> (1, d0 - d1)>(%20, %24)
+//         %26 = affine.apply affine_map<(d0) -> (-d0 + 1)>(%25)
+//         %27 = affine.min affine_map<(d0, d1) -> (-d1 + 35, 16, d0)>(%arg6, %15)
+//         %28 = affine.min affine_map<(d0, d1) -> (2, d0 - d1)>(%16, %27)
+//         %29 = affine.apply affine_map<(d0) -> (-d0 + 2)>(%28)
+//         %30 = affine.apply affine_map<()[s0, s1, s2] -> (s0 + s1 + s2)>()[%24, %19, %arg1]
+//         %31 = affine.apply affine_map<()[s0, s1] -> (s0 + s1)>()[%27, %15]
+//         %extracted_slice_3 = tensor.extract_slice %4[%30, %31] [%25, %28] [1, 1] : tensor<35x35xbf16> to tensor<?x?xbf16>
+//         %padded = tensor.pad %extracted_slice_3 low[0, 0] high[%26, %29] {
+//         ^bb0(%arg8: index, %arg9: index):
+//           tensor.yield %cst : bf16
+//         } : tensor<?x?xbf16> to tensor<1x2xbf16>
+//         %extracted_slice_4 = tensor.extract_slice %arg7[%arg5, %arg6] [1, 2] [1, 1] : tensor<16x16xbf16> to tensor<1x2xbf16>
+//         %32 = linalg.copy {lowering_config = #iree_gpu.derived_thread_config} ins(%padded : tensor<1x2xbf16>) outs(%extracted_slice_4 : tensor<1x2xbf16>) -> tensor<1x2xbf16>
+//         scf.forall.in_parallel {
+//           tensor.parallel_insert_slice %32 into %arg7[%arg5, %arg6] [1, 2] [1, 1] : tensor<1x2xbf16> into tensor<16x16xbf16>
+//         }
+//       } {mapping = [#gpu.thread<linear_dim_1>, #gpu.thread<linear_dim_0>]}
+// }
+
+
+// #####################################################################
+
+
+
+// func.func @conv_2d_bfloat16_forward_128x48x32x35_nhwc_35x1x1x35_fhwc_nhwf_1x1s_0x0p_1x1d_1g$async_dispatch_0_matmul_like_196608x35x35_bf16xbf16xf32() attributes {translation_info = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [128, 1, 1] subgroup_size = 64, {gpu_pipeline_options = #iree_gpu.pipeline_options<prefetch_shared_memory = true, no_reduce_shared_memory_bank_conflicts = false, use_igemm_convolution = false>}>} {
+//   %c3 = arith.constant 3 : index
+//   %c1 = arith.constant 1 : index
+//   %cst = arith.constant 0.000000e+00 : bf16
+//   %cst_0 = arith.constant 0.000000e+00 : f32
+//   %c0 = arith.constant 0 : index
+//   %0 = hal.interface.binding.subspan layout(<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") {iree_gpu.use_rocdl_buffer_instructions} : !iree_tensor_ext.dispatch.tensor<readonly:tensor<196608x35xbf16>>
+//   %1 = hal.interface.binding.subspan layout(<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) binding(1) alignment(64) offset(%c0) flags("ReadOnly|Indirect") {iree_gpu.use_rocdl_buffer_instructions} : !iree_tensor_ext.dispatch.tensor<readonly:tensor<35x35xbf16>>
+//   %2 = hal.interface.binding.subspan layout(<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) binding(2) alignment(64) offset(%c0) flags(Indirect) {iree_gpu.use_rocdl_buffer_instructions} : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<196608x35xbf16>>
+//   %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [196608, 35], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<196608x35xbf16>> -> tensor<196608x35xbf16>
+//   %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [35, 35], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<35x35xbf16>> -> tensor<35x35xbf16>
+//   %5 = tensor.empty() : tensor<196608x35xbf16>
+//   %6 = scf.forall (%arg0, %arg1) = (0, 0) to (196608, 35) step (128, 16) shared_outs(%arg2 = %5) -> (tensor<196608x35xbf16>) {
+//     %7 = affine.min affine_map<(d0) -> (-d0 + 35, 16)>(%arg1)
+//     %8 = tensor.empty() : tensor<8x1x16x16xf32>
+//     %9 = linalg.fill ins(%cst_0 : f32) outs(%8 : tensor<8x1x16x16xf32>) -> tensor<8x1x16x16xf32>
+//     %10 = scf.for %arg3 = %c0 to %c3 step %c1 iter_args(%arg4 = %9) -> (tensor<8x1x16x16xf32>) {
+//       %15 = affine.min affine_map<(d0) -> (35, d0 * 16)>(%arg3)
+//       %16 = affine.min affine_map<(d0) -> (-d0 + 35, 16)>(%15)
+//       %17 = affine.apply affine_map<(d0) -> (-d0 + 16)>(%16)
+//       %extracted_slice_2 = tensor.extract_slice %3[%arg0, %15] [128, %16] [1, 1] : tensor<196608x35xbf16> to tensor<128x?xbf16>
+//       %padded = tensor.pad %extracted_slice_2 low[0, 0] high[0, %17] {
+//       ^bb0(%arg5: index, %arg6: index):
+//         tensor.yield %cst : bf16
+//       } : tensor<128x?xbf16> to tensor<128x16xbf16>
+//       %18 = tensor.empty() : tensor<128x16xbf16>
+//       %19 = linalg.copy {lowering_config = #iree_gpu.derived_thread_config} ins(%padded : tensor<128x16xbf16>) outs(%18 : tensor<128x16xbf16>) -> tensor<128x16xbf16>
+//       %20 = tensor.empty() : tensor<8x1x16x16xbf16>
+//       %expanded = tensor.expand_shape %19 [[0, 1], [2, 3]] output_shape [8, 16, 1, 16] : tensor<128x16xbf16> into tensor<8x16x1x16xbf16>
+//       %transposed_3 = linalg.transpose ins(%expanded : tensor<8x16x1x16xbf16>) outs(%20 : tensor<8x1x16x16xbf16>) permutation = [0, 2, 1, 3] 
+//       %21 = affine.min affine_map<(d0) -> (-d0 + 35, 0, 16)>(%arg1)
+//       %22 = affine.min affine_map<(d0, d1) -> (16, d0 - d1)>(%7, %21)
+//       %23 = affine.apply affine_map<(d0) -> (-d0 + 16)>(%22)
+//       %24 = affine.apply affine_map<()[s0, s1] -> (s0 + s1)>()[%21, %arg1]
+//       %extracted_slice_4 = tensor.extract_slice %4[%24, %15] [%22, %16] [1, 1] : tensor<35x35xbf16> to tensor<?x?xbf16>
+//       %padded_5 = tensor.pad %extracted_slice_4 low[0, 0] high[%23, %17] {
+//       ^bb0(%arg5: index, %arg6: index):
+//         tensor.yield %cst : bf16
+//       } : tensor<?x?xbf16> to tensor<16x16xbf16>
+//       %25 = tensor.empty() : tensor<16x16xbf16>
+//       %26 = linalg.copy {lowering_config = #iree_gpu.derived_thread_config} ins(%padded_5 : tensor<16x16xbf16>) outs(%25 : tensor<16x16xbf16>) -> tensor<16x16xbf16>
+//       %27 = tensor.empty() : tensor<1x1x16x16xbf16>
+//       %expanded_6 = tensor.expand_shape %26 [[0, 1], [2, 3]] output_shape [1, 16, 1, 16] : tensor<16x16xbf16> into tensor<1x16x1x16xbf16>
+//       %transposed_7 = linalg.transpose ins(%expanded_6 : tensor<1x16x1x16xbf16>) outs(%27 : tensor<1x1x16x16xbf16>) permutation = [0, 2, 1, 3] 
+//       %28 = iree_codegen.inner_tiled ins(%transposed_3, %transposed_7) outs(%arg4) {indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>], kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_BF16>, lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_BF16>, padding = [128, 16, 16], promote_operands = [0, 1], reduction = [0, 0, 1], subgroup = [4, 1, 0], workgroup = [128, 16, 0]}>, permutations = [array<i64: 0, 1>, array<i64: 1, 0>, array<i64: 0, 1>]} : tensor<8x1x16x16xbf16>, tensor<1x1x16x16xbf16> into tensor<8x1x16x16xf32>
+//       scf.yield %28 : tensor<8x1x16x16xf32>
+//     }
+//     %extracted_slice = tensor.extract_slice %arg2[%arg0, %arg1] [128, %7] [1, 1] : tensor<196608x35xbf16> to tensor<128x?xbf16>
+//     %11 = tensor.empty() : tensor<8x1x16x16xbf16>
+//     %12 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%10 : tensor<8x1x16x16xf32>) outs(%11 : tensor<8x1x16x16xbf16>) {
+//     ^bb0(%in: f32, %out: bf16):
+//       %15 = arith.truncf %in : f32 to bf16
+//       linalg.yield %15 : bf16
+//     } -> tensor<8x1x16x16xbf16>
+//     %13 = tensor.empty() : tensor<8x16x1x16xbf16>
+//     %transposed = linalg.transpose ins(%12 : tensor<8x1x16x16xbf16>) outs(%13 : tensor<8x16x1x16xbf16>) permutation = [0, 2, 1, 3] 
+//     %collapsed = tensor.collapse_shape %transposed [[0, 1], [2, 3]] : tensor<8x16x1x16xbf16> into tensor<128x16xbf16>
+//     %extracted_slice_1 = tensor.extract_slice %collapsed[0, 0] [128, %7] [1, 1] : tensor<128x16xbf16> to tensor<128x?xbf16>
+//     %14 = linalg.copy ins(%extracted_slice_1 : tensor<128x?xbf16>) outs(%extracted_slice : tensor<128x?xbf16>) -> tensor<128x?xbf16>
+//     scf.forall.in_parallel {
+//       tensor.parallel_insert_slice %14 into %arg2[%arg0, %arg1] [128, %7] [1, 1] : tensor<128x?xbf16> into tensor<196608x35xbf16>
+//     }
+//   } {mapping = [#iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}
+//   iree_tensor_ext.dispatch.tensor.store %6, %2, offsets = [0, 0], sizes = [196608, 35], strides = [1, 1] : tensor<196608x35xbf16> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<196608x35xbf16>>
+//   return
+// }
