@@ -383,62 +383,124 @@ combineRelayoutOpChain(RewriterBase &rewriter, MapScatterOp mapScatterOp,
   }
 }
 
-static MapScatterOp
-insertIdentityMapScatter(RewriterBase &rewriter,
-                         IREE::Codegen::StoreToBufferOp storeOp) {
-  // llvm::dbgs()<<"Entered REAL insertIdentityMapScatter\n";
-  Location loc = storeOp->getLoc();
-  OpBuilder::InsertionGuard g(rewriter);
-  rewriter.setInsertionPoint(storeOp);
-  auto mapScatterDest =
-      rewriter
-          .create<tensor::EmptyOp>(
-              loc, memref::getMixedSizes(rewriter, loc, storeOp.getBuffer()),
-              storeOp.getTensor().getType().getElementType())
-          .getResult();
-  auto mapScatterOp = MapScatterOp::createIdentityMapScatter(
-      rewriter, loc, storeOp.getTensor(), mapScatterDest);
-  rewriter.modifyOpInPlace(storeOp, [&]() {
-    storeOp.getTensorMutable().assign(mapScatterOp.getResult(0));
-  });
-  LDBG("Created identity map_scatter:\n" << mapScatterOp);
-  return mapScatterOp;
-}
+// static MapScatterOp
+// insertIdentityMapScatter(RewriterBase &rewriter,
+//                          IREE::Codegen::StoreToBufferOp storeOp) {
+//   // llvm::dbgs()<<"Entered REAL insertIdentityMapScatter\n";
+//   Location loc = storeOp->getLoc();
+//   OpBuilder::InsertionGuard g(rewriter);
+//   rewriter.setInsertionPoint(storeOp);
+//   auto mapScatterDest =
+//       rewriter
+//           .create<tensor::EmptyOp>(
+//               loc, memref::getMixedSizes(rewriter, loc, storeOp.getBuffer()),
+//               storeOp.getTensor().getType().getElementType())
+//           .getResult();
+//   auto mapScatterOp = MapScatterOp::createIdentityMapScatter(
+//       rewriter, loc, storeOp.getTensor(), mapScatterDest);
+//   rewriter.modifyOpInPlace(storeOp, [&]() {
+//     storeOp.getTensorMutable().assign(mapScatterOp.getResult(0));
+//   });
+//   LDBG("Created identity map_scatter:\n" << mapScatterOp);
+//   return mapScatterOp;
+// }
 
 // ##############################################################################################
+// static MapScatterOp
+// // void
+// insertIdentityMapScatter(RewriterBase &rewriter,
+//                          tensor::ParallelInsertSliceOp parallelinsertsliceop, scf::ForallOp forallOp) {
+//   llvm::dbgs()<<"Debug\n";
+//   // Get the source location, the place in the MLIR source where the operation appears
+//   Location loc = parallelinsertsliceop->getLoc();
+  
+//   // get the forall op
+//   Operation *parentOp = parallelinsertsliceop->getParentOp();
+//   llvm::dbgs()<<"Name is "<<parentOp->getName()<<"\n";
+
+//   auto forallOp2 = dyn_cast<scf::ForallOp>(parentOp);
+//   if(forallOp2)
+//   {
+//     llvm::dbgs()<<"Got the parent"<<parentOp->getName()<<"\n";
+//   }
+
+//   // insert the new op before the terminator of the forall op
+//   OpBuilder::InsertionGuard g(rewriter);
+//   rewriter.setInsertionPoint(parentOp);
+  
+  
+
+//   // get the tensor slice that the thread wants to insert.
+//    Value source = parallelinsertsliceop.getSource();
+//    Type bf16Type = rewriter.getBF16Type();
+  
+//    // create an empty tensor to store the result of the map_scatter
+//   auto mapScatterDest =
+//       rewriter
+//           .create<tensor::EmptyOp>(
+//               loc, tensor::getMixedSizes(rewriter, loc, source), bf16Type)
+//           .getResult();
+//   auto mapScatterOp = MapScatterOp::createIdentityMapScatter(
+//       rewriter, loc, source, mapScatterDest);
+
+//   // input to the parallel_insert_slice op is the output of the map_scatter 
+//   rewriter.modifyOpInPlace(parallelinsertsliceop, [&]() {
+//     parallelinsertsliceop.getSourceMutable().assign(mapScatterOp.getResult(0));
+//   });
+//   LDBG("Created identity map_scatter:\n" << mapScatterOp);
+//   return mapScatterOp;
+// }
+
 static MapScatterOp
-// void
-insertIdentityMapScatter(RewriterBase &rewriter,
-                         tensor::ParallelInsertSliceOp parallelinsertsliceop, scf::ForallOp forallOp) {
-  
-  // Get the source location, the place in the MLIR source where the operation appears
-  Location loc = parallelinsertsliceop->getLoc();
-  
+insertIdentityMapScatter(RewriterBase &rewriter, Operation * op)
+{
+  Location loc = op->getLoc();
+  Value source;
+  // Type bf16Type;
 
-  // insert the new op before the terminator of the forall op
   OpBuilder::InsertionGuard g(rewriter);
-  rewriter.setInsertionPoint(forallOp.getTerminator());
-  
-
-  // get the tensor slice that the thread wants to insert.
-   Value source = parallelinsertsliceop.getSource();
-   Type bf16Type = rewriter.getBF16Type();
-  
-   // create an empty tensor to store the result of the map_scatter
-  auto mapScatterDest =
-      rewriter
-          .create<tensor::EmptyOp>(
-              loc, tensor::getMixedSizes(rewriter, loc, source), bf16Type)
-          .getResult();
-  auto mapScatterOp = MapScatterOp::createIdentityMapScatter(
-      rewriter, loc, source, mapScatterDest);
-
-  // input to the parallel_insert_slice op is the output of the map_scatter 
-  rewriter.modifyOpInPlace(parallelinsertsliceop, [&]() {
-    parallelinsertsliceop.getSourceMutable().assign(mapScatterOp.getResult(0));
-  });
-  LDBG("Created identity map_scatter:\n" << mapScatterOp);
-  return mapScatterOp;
+  if(auto storeOp = dyn_cast<IREE::Codegen::StoreToBufferOp>(op)){
+    // Location loc = storeOp->getLoc();
+    rewriter.setInsertionPoint(storeOp);
+    auto mapScatterDest =
+        rewriter
+            .create<tensor::EmptyOp>(
+                loc, memref::getMixedSizes(rewriter, loc, storeOp.getBuffer()),
+                storeOp.getTensor().getType().getElementType())
+            .getResult();
+    auto mapScatterOp = MapScatterOp::createIdentityMapScatter(
+        rewriter, loc, storeOp.getTensor(), mapScatterDest);
+    rewriter.modifyOpInPlace(storeOp, [&]() {
+      storeOp.getTensorMutable().assign(mapScatterOp.getResult(0));
+    });
+    LDBG("Created identity map_scatter:\n" << mapScatterOp);
+    return mapScatterOp;
+  }
+  else if(auto parallelinsertsliceop = dyn_cast<tensor::ParallelInsertSliceOp>(op)){
+    // Location loc = parallelinsertsliceop->getLoc();
+    // Operation *parentOp = parallelinsertsliceop->getParentOp();
+    rewriter.setInsertionPoint(parallelinsertsliceop->getParentOp());
+    source = parallelinsertsliceop.getSource();
+    // bf16Type = rewriter.getBF16Type();
+    auto mapScatterDest =
+        rewriter
+            .create<tensor::EmptyOp>(
+                // loc, tensor::getMixedSizes(rewriter, loc, source), bf16Type)
+                loc, tensor::getMixedSizes(rewriter, loc, source), dyn_cast<mlir::TensorType>(source.getType()).getElementType())
+            .getResult();
+    auto mapScatterOp = MapScatterOp::createIdentityMapScatter(
+        rewriter, loc, source, mapScatterDest); 
+    rewriter.modifyOpInPlace(parallelinsertsliceop, [&]() {
+      parallelinsertsliceop.getSourceMutable().assign(mapScatterOp.getResult(0));
+    });
+    LDBG("Created identity map_scatter:\n" << mapScatterOp);
+    return mapScatterOp;
+  }
+  else{
+    // Error case unsupported op.
+    LDBG("No identity map_scatter created\n");
+    return NULL;
+  }
 }
 
 // ##########################################################################################
@@ -522,13 +584,42 @@ combineLayoutTransformation(MLIRContext *ctx, FunctionOpInterface funcOp,
                         llvm::IsaPred<IREE::Codegen::WorkgroupMappingAttr>);
 
     if(hasWorkgroupMapping && !forallOp.getRegionIterArgs().empty()) {
+      // iterate over each region arg
+      for(BlockArgument bbArg : forallOp.getRegionIterArgs()){
         SmallVector<Operation *> parallelInsertOps = forallOp.getCombiningOps(
-        forallOp.getRegionIterArgs()[0]);
-        auto parallelInsertOp =
-        dyn_cast<tensor::ParallelInsertSliceOp>(parallelInsertOps.front());
+        bbArg);
+
+        // for(Operation *op : parallelInsertOps){
+        //   MapScatterOp mapScatterOp =
+        //     // insertIdentityMapScatter(rewriter, parallelInsertOp, forallOp);
+        //     insertIdentityMapScatter(rewriter, op);
+        //   if(mapScatterOp)
+        //     combineRelayoutOpChain(rewriter, mapScatterOp, padDistributionConfigFn);
+        // }
+        if (parallelInsertOps.size() != 1) {
+          return WalkResult::skip();
+        }
+
+
         MapScatterOp mapScatterOp =
-            insertIdentityMapScatter(rewriter, parallelInsertOp, forallOp);
-        combineRelayoutOpChain(rewriter, mapScatterOp, padDistributionConfigFn);
+            // insertIdentityMapScatter(rewriter, parallelInsertOp, forallOp);
+            insertIdentityMapScatter(rewriter, parallelInsertOps.front());
+        if(mapScatterOp)
+          combineRelayoutOpChain(rewriter, mapScatterOp, padDistributionConfigFn);
+      }
+
+
+        // SmallVector<Operation *> parallelInsertOps = forallOp.getCombiningOps(
+        // forallOp.getRegionIterArgs()[0]);
+        // // auto parallelInsertOp =
+        // // dyn_cast<tensor::ParallelInsertSliceOp>(parallelInsertOps.front());
+        // // auto parallelInsertOp =
+        // // dyn_cast<Operation *>(parallelInsertOps.front());
+        // MapScatterOp mapScatterOp =
+        //     // insertIdentityMapScatter(rewriter, parallelInsertOp, forallOp);
+        //     insertIdentityMapScatter(rewriter, parallelInsertOps.front());
+        // if(mapScatterOp)
+        //   combineRelayoutOpChain(rewriter, mapScatterOp, padDistributionConfigFn);
     }
     return WalkResult::advance();
     });
