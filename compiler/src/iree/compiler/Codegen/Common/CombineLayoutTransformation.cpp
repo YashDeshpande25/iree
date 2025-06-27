@@ -495,8 +495,9 @@ static MapScatterOp insertIdentityMapScatter(RewriterBase &rewriter,
     return mapScatterOp;
   } else {
     // Error case unsupported op.
-    LDBG("No identity map_scatter created\n");
-    return NULL;
+    op->emitError("Unsupported Op, identity map_scatter is created only for "
+                  "storeOp & parallel_insert_slice.\n");
+    return nullptr;
   }
 }
 
@@ -579,7 +580,8 @@ combineLayoutTransformation(MLIRContext *ctx, FunctionOpInterface funcOp,
         llvm::any_of(forallOp.getMapping().value(),
                      llvm::IsaPred<IREE::Codegen::WorkgroupMappingAttr>);
 
-    if (hasWorkgroupMapping && !forallOp.getRegionIterArgs().empty()) {
+    // if (hasWorkgroupMapping && !forallOp.getRegionIterArgs().empty()) {
+    if (hasWorkgroupMapping) {
       // iterate over each region arg
       for (BlockArgument bbArg : forallOp.getRegionIterArgs()) {
         SmallVector<Operation *> parallelInsertOps =

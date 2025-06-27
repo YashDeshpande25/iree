@@ -337,9 +337,8 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
     LDBG("Attempting to deduce unaligned TileAndFuse MMA schedulee");
     mustBeAligned = false;
     // doCPromotion = true;
-    schedule = getMmaScheduleFromProblemAndTarget(target, problem,
-                                                  transposedLhs, transposedRhs,
-                                                  mustBeAligned);
+    schedule = getMmaScheduleFromProblemAndTarget(
+        target, problem, transposedLhs, transposedRhs, mustBeAligned);
   }
 
   if (!schedule) {
