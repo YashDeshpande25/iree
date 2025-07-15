@@ -96,19 +96,22 @@ struct ExpandDestinationForOp final
   LogicalResult matchAndRewrite(scf::YieldOp yieldOp,
                                 PatternRewriter &rewriter) const override {
 
-    if (yieldOp->getParentOp()->hasAttr("expand_destination_hoisted"))
-      return failure();
+    // if (yieldOp->getParentOp()->hasAttr("expand_destination_hoisted"))
+    //   return failure();
     Location loc = yieldOp.getLoc();
-    // MLIRContext *ctx = getContext();
+    
     auto unpackOp =
         yieldOp.getOperand(0).getDefiningOp<linalg::UnPackOp>();
 
-    llvm::dbgs()<<"\n---------------------------------------------------------------------------\nunpackOp : "<<unpackOp<<"\n\n";
+    // llvm::dbgs()<<"\n------------------------------------xxx---------------------------------------\nunpackOp : "<<unpackOp<<"\n\n";
     // No unpack op to hoist out.
     if (!unpackOp)
       return failure();
 
-    auto innerTiledOp = unpackOp.getOperand(0).getDefiningOp<IREE::Codegen::InnerTiledOp>();
+    auto yieldOpProducer = unpackOp.getOperand(0).getDefiningOp<Operation *>();
+    auto innerTiledOp = dyn_cast<IREE::Codegen::InnerTiledOp>(yieldOpProducer);
+
+    // auto innerTiledOp = unpackOp.getOperand(0).getDefiningOp<IREE::Codegen::InnerTiledOp>();
     llvm::dbgs()<<"innerTiledOp : "<<innerTiledOp<<"\n\n";
 
 
@@ -155,8 +158,8 @@ struct ExpandDestinationForOp final
     // }
     // This pattern only supports for ops with single
     // output.
-    SmallVector<Value> forOutputs(forOp.getResults());
-    llvm::dbgs()<<"Number of Outputs is "<<forOutputs.size()<<"\n";
+    // SmallVector<Value> forOutputs(forOp.getResults());
+    // llvm::dbgs()<<"Number of Outputs is "<<forOutputs.size()<<"\n";
 
     // SmallVector<ReassociationIndices> reIndices =
     //     unpackOp.getReassociationIndices();
@@ -268,7 +271,7 @@ struct ExpandDestinationForOp final
 
 
     rewriter.modifyOpInPlace(
-      yieldOp, [&]() { yieldOp->setOperand(0, innerTiledOp.getResult(0)); });
+      yieldOp, [&]() { yieldOp->setOperand(0, yieldOpProducer->getResult(0)); });
 
     rewriter.modifyOpInPlace(
       innerTiledOp, [&]() { innerTiledOp->setOperand(2, newForOp.getRegionIterArgs()[0]); });
@@ -301,7 +304,7 @@ struct ExpandDestinationForOp final
       }
     }
     llvm::dbgs()<<"Return Success\n";
-    newForOp->setAttr("expand_destination_hoisted", rewriter.getUnitAttr());
+    // newForOp->setAttr("expand_destination_hoisted", rewriter.getUnitAttr());
     return success();
   }
 };
