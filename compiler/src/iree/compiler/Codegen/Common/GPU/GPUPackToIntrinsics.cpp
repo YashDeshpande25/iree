@@ -89,6 +89,97 @@ struct ConvertToMultiMma final : OpInterfaceRewritePattern<linalg::LinalgOp> {
   }
 };
 
+// This pattern hoists pack & unpack ops out of scf.for op.
+struct PackDestinationForOp final : OpRewritePattern<scf::YieldOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(scf::YieldOp yieldOp,
+                                PatternRewriter &rewriter) const override {
+
+    Location loc = yieldOp.getLoc();
+    linalg::UnPackOp unpackOp;
+    if (yieldOp.getNumOperands())
+      unpackOp = yieldOp.getOperand(0).getDefiningOp<linalg::UnPackOp>();
+
+    // No unpack op to hoist out.
+    if (!unpackOp)
+      return failure();
+
+    // Get the enclosing scf.for op.
+    auto parentOp = yieldOp->getParentOp();
+    auto forOp = dyn_cast<scf::ForOp>(parentOp);
+    if (!forOp)
+      return failure();
+
+    // Get the packOp corresponding to the unpackOp.
+    linalg::PackOp packOp;
+    for (auto user : forOp.getRegionIterArgs()[0].getUsers()) {
+      packOp = dyn_cast<linalg::PackOp>(user);
+
+      // Both the packOp & unpackOp should have the same packing attributes.
+      if (packOp &&
+          ((packOp.getInnerDimsPos() != unpackOp.getInnerDimsPos()) ||
+           (packOp.getMixedTiles() != unpackOp.getMixedTiles()) ||
+           (packOp.getOuterDimsPerm() != unpackOp.getOuterDimsPerm()))) {
+        packOp = nullptr;
+      }
+    }
+    if (!packOp)
+      return failure();
+
+    // Create the pack -> new scf.for -> unpack chain.
+    rewriter.setInsertionPoint(forOp);
+    Value input = linalg::PackOp::createDestinationTensor(
+        rewriter, loc, forOp.getInitArgs()[0], packOp.getMixedTiles(),
+        packOp.getInnerDimsPos(), packOp.getOuterDimsPerm());
+
+    auto packedDest = rewriter.create<linalg::PackOp>(
+        loc, forOp.getInitArgs()[0], input, packOp.getInnerDimsPos(),
+        packOp.getMixedTiles(), packOp.getPaddingValue(),
+        packOp.getOuterDimsPerm());
+
+    scf::ForOp newForOp = rewriter.create<scf::ForOp>(
+        loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+        ValueRange{packedDest});
+
+    // Destination tensor for the new unpackOp, based on the shape of the
+    // original tensor that got packed, to help unpack into unaligned shapes and
+    // drop padding added by the packOp.
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, packOp.getSourceType().getShape(),
+        packOp.getSourceType().getElementType());
+
+    auto unpackedOutput = rewriter.create<linalg::UnPackOp>(
+        loc, newForOp.getResults()[0], empty, unpackOp.getInnerDimsPos(),
+        unpackOp.getMixedTiles(), unpackOp.getOuterDimsPerm());
+
+    // Users of the result of unpackOp must use the input to the unpackOp.
+    unpackOp->getResult(0).replaceAllUsesWith(unpackOp.getOperand(0));
+
+    // Users of the result of packOp must use the init of the forOp.
+    for (auto user : forOp.getRegionIterArgs()[0].getUsers()) {
+      user->getResult(0).replaceAllUsesWith(newForOp.getRegionIterArgs()[0]);
+    }
+
+    // Merge the old scf.for block with the new scf.for block.
+    SmallVector<Value> ivs = {newForOp.getInductionVar()};
+    SmallVector<Value> argReplacements(ivs);
+    argReplacements.append(newForOp.getRegionIterArgs().begin(),
+                           newForOp.getRegionIterArgs().end());
+
+    rewriter.mergeBlocks(forOp.getBody(), newForOp.getBody(), argReplacements);
+
+    // Replaces the uses of the old scf.for with the new scf.for.
+    for (int idx = 0; idx < forOp->getNumResults(); ++idx) {
+      if (idx == 0) {
+        forOp->getResult(idx).replaceAllUsesWith(unpackedOutput->getResult(0));
+      } else {
+        forOp->getResult(idx).replaceAllUsesWith(newForOp->getResult(idx));
+      }
+    }
+    return success();
+  }
+};
+
 void GPUPackToIntrinsicsPass::runOnOperation() {
   MLIRContext *context = &getContext();
   auto funcOp = getOperation();
@@ -137,6 +228,7 @@ void GPUPackToIntrinsicsPass::runOnOperation() {
   };
 
   linalg::populateDataLayoutPropagationPatterns(patterns, control);
+  patterns.add<PackDestinationForOp>(context);
   linalg::UnPackOp::getCanonicalizationPatterns(patterns, context);
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
