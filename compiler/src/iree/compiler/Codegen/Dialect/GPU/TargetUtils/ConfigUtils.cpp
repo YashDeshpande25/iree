@@ -398,6 +398,12 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
 
   IREE::GPU::MmaInterfaceAttr mmaKind = schedule->mmaKind;
 
+  // ######################## TO REMOVE ####################
+  int64_t innerKDim = contractionDims.k.back();
+  int64_t kPackFactor = std::get<2>(mmaKind.getMNKShape());
+  reductionTileSizes[innerKDim] *= kPackFactor;
+  // #######################################################
+
   // Attach the MMA schedule as an attribute to the entry point export function
   // for later access in the pipeline.
   MLIRContext *context = lhs.getContext();
@@ -428,8 +434,8 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
       paddingTileSizes[kDim] = reductionTileSizes[kDim];
     }
 
-    int64_t innerKDim = contractionDims.k.back();
-    int64_t kPackFactor = std::get<2>(mmaKind.getMNKShape());
+    // int64_t innerKDim = contractionDims.k.back();
+    // int64_t kPackFactor = std::get<2>(mmaKind.getMNKShape());
     paddingTileSizes[innerKDim] *= kPackFactor;
 
     attrs.emplace_back(StringAttr::get(context, "padding"),
