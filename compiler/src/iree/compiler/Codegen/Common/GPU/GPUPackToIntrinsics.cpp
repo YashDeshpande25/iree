@@ -104,54 +104,31 @@ struct PackDestinationForOp final : OpRewritePattern<scf::YieldOp> {
 
     linalg::UnPackOp unpackOp;
     linalg::PackOp packOp;
-    int64_t tiedResultIdx = 0; // To change
+    int64_t tiedResultIdx = 0; 
 
-    // ###############################################################################
+    // Iterate through all operands of yieldOp & hoist each available pack-unpack pair.
     for (auto operand : yieldOp.getOperands()) {
       unpackOp = operand.getDefiningOp<linalg::UnPackOp>();
-      // auto iterArg = forOp.getRegionIterArgs()[tiedResultIdx];
       if (!unpackOp) {
-        // llvm::dbgs()<<"No unpackOp found index : "<<tiedResultIdx<<"\n";
         tiedResultIdx++;
         continue;
       }
 
-      // Get the corresponding packOp.
+      // Apply the pattern only if packOp & unpackOp are the only 2 users of the regionIterArg.
       auto iterArg = forOp.getRegionIterArgs()[tiedResultIdx];
-      // llvm::dbgs() << "Users of iterArg : "<<iterArg<<" = " <<
-      // iterArg.getNumUses() << "\n";
       if (iterArg.getNumUses() != 2) {
         tiedResultIdx++;
         continue;
       }
 
+      // Get the corresponding packOp.
       for (auto user : iterArg.getUsers()) {
-
         packOp = dyn_cast<linalg::PackOp>(user);
-        // llvm::dbgs()<<"User of iterArg is "<<user<<"\n";
-        // if(packOp)
-        //   // llvm::dbgs()<<"Found a packOp\n";
-        // if(!packOp)
-        // llvm::dbgs()<<"Not a packOp\n";
-        // ######################################################################
-        //   if (packOp &&
-        //     ((packOp.getInnerDimsPos() != unpackOp.getInnerDimsPos()) ||
-        //      (packOp.getMixedTiles() != unpackOp.getMixedTiles()) ||
-        //      (packOp.getOuterDimsPerm() != unpackOp.getOuterDimsPerm()))) {
-        //   llvm::dbgs()<<"Got NO suitable packOp\n";
-        //   // break;
-        //   packOp = nullptr;
-        // }
-        // else
-        //   break;
-        // #######################################################################
         if (packOp &&
             ((packOp.getInnerDimsPos() == unpackOp.getInnerDimsPos()) &&
              (packOp.getMixedTiles() == unpackOp.getMixedTiles()) &&
              (packOp.getOuterDimsPerm() == unpackOp.getOuterDimsPerm()))) {
-          // llvm::dbgs()<<"Got suitable packOp\n";
           break;
-          // packOp = nullptr;
         } else {
           packOp = nullptr;
         }
@@ -159,82 +136,11 @@ struct PackDestinationForOp final : OpRewritePattern<scf::YieldOp> {
       if (packOp && unpackOp) {
         break;
       }
-      // llvm::dbgs()<<"Reached end of loop, Index value :
-      // "<<tiedResultIdx<<"-------\n\n";
       tiedResultIdx++;
     }
-
     if (!packOp || !unpackOp) {
-      // llvm::dbgs()<<"PackOp or UnpackOp not found\n";
       return failure();
     }
-
-    // llvm::dbgs()<<"starting the chain\n";
-    // #######################################################################################
-    // // Iterate through all the operands of yieldOp to apply pattern for the
-    // unpack found first.
-    // // applied recursively you will handle all unpack operands if there are
-    // muliple. for(auto operand : yieldOp.getOperands())
-    // {
-    //   unpackOp = operand.getDefiningOp<linalg::UnPackOp>();
-    //   if(unpackOp){
-    //     break;
-    //   }
-    //   tiedResultIdx++;
-    // }
-    // if(!unpackOp)
-    //   return failure();
-
-    // auto iterArg = forOp.getRegionIterArgs()[tiedResultIdx];
-    // llvm::dbgs()<<"iterArg is "<<iterArg<<"\n";
-    // llvm::dbgs()<<"iterArg has 1 use : "<<iterArg.hasOneUse()<<"\n";
-    // // Get the corresponding packOp.
-    //   for (auto user : iterArg.getUsers()) {
-    //     packOp = dyn_cast<linalg::PackOp>(user);
-    //     // Both the packOp & unpackOp should have the same packing
-    //     attributes. if (packOp &&
-    //        ((packOp.getInnerDimsPos() != unpackOp.getInnerDimsPos()) ||
-    //         (packOp.getMixedTiles() != unpackOp.getMixedTiles()) ||
-    //         (packOp.getOuterDimsPerm() != unpackOp.getOuterDimsPerm()))) {
-    //         packOp = nullptr;
-    //       }
-    //   }
-
-    // // No unpack/packOp op to hoist out.
-    // if (!unpackOp || !packOp)
-    //   return failure();
-    // ########################################################################
-    // Location loc = yieldOp.getLoc();
-    // linalg::UnPackOp unpackOp;
-    // if (yieldOp.getNumOperands())
-    //   unpackOp = yieldOp.getOperand(0).getDefiningOp<linalg::UnPackOp>();
-
-    // // No unpack op to hoist out.
-    // if (!unpackOp)
-    //   return failure();
-
-    // // Get the enclosing scf.for op.
-    // auto parentOp = yieldOp->getParentOp();
-    // auto forOp = dyn_cast<scf::ForOp>(parentOp);
-    // if (!forOp)
-    //   return failure();
-
-    // Get the packOp corresponding to the unpackOp.
-    // linalg::PackOp packOp;
-    // for (auto user : forOp.getRegionIterArgs()[0].getUsers()) {
-    //   packOp = dyn_cast<linalg::PackOp>(user);
-
-    //   // Both the packOp & unpackOp should have the same packing attributes.
-    //   if (packOp &&
-    //       ((packOp.getInnerDimsPos() != unpackOp.getInnerDimsPos()) ||
-    //        (packOp.getMixedTiles() != unpackOp.getMixedTiles()) ||
-    //        (packOp.getOuterDimsPerm() != unpackOp.getOuterDimsPerm()))) {
-    //     packOp = nullptr;
-    //   }
-    // }
-    // if (!packOp)
-    //   return failure();
-    // #################################################################################
 
     // Create the pack -> new scf.for -> unpack chain.
     rewriter.setInsertionPoint(forOp);
@@ -248,34 +154,12 @@ struct PackDestinationForOp final : OpRewritePattern<scf::YieldOp> {
         packOp.getInnerDimsPos(), packOp.getMixedTiles(),
         packOp.getPaddingValue(), packOp.getOuterDimsPerm());
 
-    // llvm::dbgs()<<"New packOp created\n";
-
-    // auto packOpValues = ValueRange{packedDest};
     auto packOpValues = llvm::to_vector_of<Value>(forOp.getInitArgs());
-    // for (auto some_Value : packOpValues)
-    // {
-    //   // llvm::dbgs()<<"value from the new PackOp : "<<some_Value<<"\n";
-    // }
-
-    // llvm::dbgs()<<"Result of the new packOp :
-    // "<<packedDest.getResult()<<"\n";
-
     packOpValues[tiedResultIdx] = packedDest.getResult();
-
-    // for (auto initArg : packOpValues)
-    // {
-    //   // llvm::dbgs()<<"initIterArg : "<<initArg<<"\n";
-    // }
-
-    // llvm::dbgs()<<"ValueRange : "<<ValueRange{packedDest}<<"\n";
-    // scf::ForOp newForOp = rewriter.create<scf::ForOp>(
-    //     loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
-    //     ValueRange{packedDest});
     scf::ForOp newForOp = rewriter.create<scf::ForOp>(
         loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
         packOpValues);
 
-    // llvm::dbgs()<<"forOp created\n";
     // Destination tensor for the new unpackOp, based on the shape of the
     // original tensor that got packed, to help unpack into unaligned shapes and
     // drop padding added by the packOp.
@@ -288,7 +172,6 @@ struct PackDestinationForOp final : OpRewritePattern<scf::YieldOp> {
         unpackOp.getInnerDimsPos(), unpackOp.getMixedTiles(),
         unpackOp.getOuterDimsPerm());
 
-    // llvm::dbgs()<<"packOp created\n";
     // Users of the result of unpackOp must use the input to the unpackOp.
     unpackOp->getResult(0).replaceAllUsesWith(unpackOp.getOperand(0));
 
@@ -298,29 +181,21 @@ struct PackDestinationForOp final : OpRewritePattern<scf::YieldOp> {
           newForOp.getRegionIterArgs()[tiedResultIdx]);
     }
 
-    // llvm::dbgs()<<"Replaced uses\n";
-
     // Merge the old scf.for block with the new scf.for block.
     SmallVector<Value> ivs = {newForOp.getInductionVar()};
     SmallVector<Value> argReplacements(ivs);
-    // llvm::dbgs()<<"created the vectors\n";
     argReplacements.append(newForOp.getRegionIterArgs().begin(),
                            newForOp.getRegionIterArgs().end());
-
-    // llvm::dbgs()<<"Append completed\n";
     rewriter.mergeBlocks(forOp.getBody(), newForOp.getBody(), argReplacements);
-    // llvm::dbgs()<<"Merged Blocks\n";
 
     // Replaces the uses of the old scf.for with the new scf.for.
     for (int idx = 0; idx < forOp->getNumResults(); ++idx) {
       if (idx == tiedResultIdx) {
         forOp->getResult(idx).replaceAllUsesWith(unpackedOutput->getResult(0));
       } else {
-        // llvm::dbgs()<<"Entered last else case\n";
         forOp->getResult(idx).replaceAllUsesWith(newForOp->getResult(idx));
       }
     }
-    // llvm::dbgs()<<"Return Success\n";
     return success();
   }
 };
