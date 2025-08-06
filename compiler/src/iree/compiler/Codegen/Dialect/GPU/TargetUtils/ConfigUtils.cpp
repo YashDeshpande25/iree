@@ -210,6 +210,7 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
                                         ArrayRef<Value> operands,
                                         IREE::GPU::TargetAttr target,
                                         bool useDirectLoad, bool scaled) {
+  llvm::dbgs()<<"getMatmulLoweringConfigAndWorkgroupSize called\n";
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -1131,6 +1132,7 @@ LogicalResult
 setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
                                    mlir::FunctionOpInterface entryPoint,
                                    Operation *computeOp) {
+  llvm::dbgs()<<"Direct Convolution Config function called \n";
   auto op = dyn_cast<linalg::LinalgOp>(computeOp);
   if (target.getWgp().getMma().empty())
     return failure();
@@ -1281,7 +1283,8 @@ setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
       schedule->nSubgroupCounts[0] * schedule->nTileSizes[0] * schedule->nSize;
   subgroupTileSizes[nDim] = schedule->nTileSizes[0];
 
-  reductionTileSizes[kDim] = schedule->kTileSizes[0] * schedule->kSize;
+  // reductionTileSizes[kDim] = schedule->kTileSizes[0] * schedule->kSize;
+  reductionTileSizes[kDim] = schedule->kTileSizes[0];
 
   Builder b(context);
   SmallVector<NamedAttribute, 4> attrs = {

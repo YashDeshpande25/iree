@@ -436,7 +436,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createGPUPadOperandsPass());
   funcPassManager.addPass(createGPUPromoteMatmulOperandsPass());
 
-  if (!pipelineOptions.useDirectConvolution) {
+  // if (!pipelineOptions.useDirectConvolution) {
     funcPassManager.addPass(createGPUPackToIntrinsicsPass());
     // Decompose packs and unpacks that are at the function boundary.
     funcPassManager.addPass(createDecomposeBoundaryPackUnPackOpsPass());
@@ -452,7 +452,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
           IREE::GPU::createExpandUndistributedInnerTilesPass());
     }
     funcPassManager.addPass(createPropagateReshapesByExpansionPass());
-  }
+  // }
 
   // Step 2. Tile and fuse tileable ops to reduction loops.
   {
@@ -463,23 +463,23 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
     funcPassManager.addPass(createCSEPass());
   }
 
-  if (pipelineOptions.useDirectConvolution) {
-    funcPassManager.addPass(createGPUPackToIntrinsicsPass());
-    // Decompose packs and unpacks that are at the function boundary.
-    funcPassManager.addPass(createDecomposeBoundaryPackUnPackOpsPass());
+  // if (pipelineOptions.useDirectConvolution) {
+  //   funcPassManager.addPass(createGPUPackToIntrinsicsPass());
+  //   // Decompose packs and unpacks that are at the function boundary.
+  //   funcPassManager.addPass(createDecomposeBoundaryPackUnPackOpsPass());
 
-    // Step 1.5. Expand result shapes of MultiMmaOps before tiling, and
-    // propagate reshapes to the function boundary.
-    {
-      IREE::GPU::ExpandUndistributedInnerTilesPassOptions options;
-      options.expandInputs = false;
-      options.expandOutputs = true;
-      // Note: options not passed in was previous behavior from PR #18179.
-      funcPassManager.addPass(
-          IREE::GPU::createExpandUndistributedInnerTilesPass());
-    }
-    funcPassManager.addPass(createPropagateReshapesByExpansionPass());
-  }
+  //   // Step 1.5. Expand result shapes of MultiMmaOps before tiling, and
+  //   // propagate reshapes to the function boundary.
+  //   {
+  //     IREE::GPU::ExpandUndistributedInnerTilesPassOptions options;
+  //     options.expandInputs = false;
+  //     options.expandOutputs = true;
+  //     // Note: options not passed in was previous behavior from PR #18179.
+  //     funcPassManager.addPass(
+  //         IREE::GPU::createExpandUndistributedInnerTilesPass());
+  //   }
+  //   funcPassManager.addPass(createPropagateReshapesByExpansionPass());
+  // }
 
   // Step 3. Decompose pack and unpack ops and propagate the resulting reshapes.
   funcPassManager.addPass(createDecomposePackUnPackOpsPass(

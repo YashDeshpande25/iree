@@ -214,7 +214,7 @@ struct PackDestinationForOp final : OpRewritePattern<scf::YieldOp> {
       // Apply the pattern only if packOp & unpackOp are the only 2 users of the
       // regionIterArg.
       auto iterArg = forOp.getRegionIterArgs()[idx];
-      if (iterArg.getNumUses() != 2) {
+      if (iterArg.getNumUses() > 2) {
         continue;
       }
 
