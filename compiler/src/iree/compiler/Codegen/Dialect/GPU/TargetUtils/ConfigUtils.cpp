@@ -32,15 +32,6 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 
-
-///////////////////////////////////////////////////////
-#include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
-#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
-#include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
-#include "mlir/Analysis/DataFlowFramework.h"
-///////////////////////////////////////////////////////
-
-
 #define DEBUG_TYPE "iree-gpu-config-utils"
 
 static llvm::cl::opt<bool> clGPUTestCpromotion(
@@ -666,7 +657,6 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     bool isGemm, bool scaled, int64_t splitReductionTripCnt,
     bool cPromoteIfPadding, bool hasExistingAccumulator = false,
     std::optional<ConvToIgemmInfo> convToIgemmInfo = std::nullopt) {
-      llvm::dbgs() << "getMatmulOrIGEMMLoweringConfigAndWorkgroupSize called\n";
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -1103,78 +1093,9 @@ LogicalResult setIGEMMConvolutionLoweringConfig(
       workgroupSize, targetSubgroupSize, pipelineConfig);
 }
 
-
-/// Helper function to get bounds using IntegerRangeAnalysis
-static FailureOr<SmallVector<int64_t>> 
-getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp, 
-                               mlir::FunctionOpInterface entryPoint) {
-  // MLIRContext *context = linalgOp.getContext();
-  // Create DataFlowSolver and run IntegerRangeAnalysis
-  DataFlowSolver solver;
-  solver.load<dataflow::DeadCodeAnalysis>();
-  solver.load<dataflow::SparseConstantPropagation>();
-  solver.load<dataflow::IntegerRangeAnalysis>();
-  
-  if (failed(solver.initializeAndRun(entryPoint))) {
-    LDBG() << "Failed to run integer range analysis, falling back to static bounds";
-    return linalgOp.getStaticLoopRanges();
-  }
-  
-  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
-  OpBuilder builder(linalgOp);  // ✅ Persistent OpBuilder object
-SmallVector<OpFoldResult> loopRanges = linalgOp.createFlatListOfOperandDims(
-    builder, linalgOp.getLoc());
-  // Try to refine dynamic bounds using range analysis
-  for (auto [idx, bound] : llvm::enumerate(bounds)) {
-    if (!ShapedType::isDynamic(bound)) {
-      continue; // Keep static bounds as-is
-    }
-    
-    // Get the Value representing this dimension
-    if (idx >= loopRanges.size()) {
-      LDBG() << "Index " << idx << " out of range for loop ranges, using INT64_MAX";
-      bounds[idx] = std::numeric_limits<int64_t>::max();
-      continue;
-    }
-    
-    auto dimValue = dyn_cast_if_present<Value>(loopRanges[idx]);
-    if (!dimValue) {
-      LDBG() << "Could not get Value for dimension " << idx << ", using INT64_MAX";
-      bounds[idx] = std::numeric_limits<int64_t>::max();
-      continue;
-    }
-    
-    // Use getDynamicUpperBound helper (similar to ROCDLConfigureBufferInstructions)
-    FailureOr<int64_t> upperBound = getDynamicUpperBound(dimValue, solver);
-    
-    if (succeeded(upperBound)) {
-      int64_t constantBound = *upperBound;
-      // Sanity check: ensure bound is reasonable
-      if (constantBound > 0 && constantBound < std::numeric_limits<int64_t>::max()) {
-        bounds[idx] = constantBound;
-        LDBG() << "Refined bound for dim " << idx << " from dynamic to " 
-               << constantBound << " using getDynamicUpperBound";
-      } else {
-        LDBG() << "Upper bound for dim " << idx << " is unreasonable (" 
-               << constantBound << "), using INT64_MAX";
-        bounds[idx] = std::numeric_limits<int64_t>::max();
-      }
-    } else {
-      // getDynamicUpperBound failed, use INT64_MAX as fallback
-      LDBG() << "getDynamicUpperBound failed for dim " << idx 
-             << ", using INT64_MAX";
-      bounds[idx] = std::numeric_limits<int64_t>::max();
-    }
-  }
-  
-  return bounds;
-}
-
-
 LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
                                       mlir::FunctionOpInterface entryPoint,
                                       Operation *op, bool useDirectLoad) {
-  llvm::dbgs() << "setMatmulLoweringConfig called \n";
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   if (!linalgOp ||
       (!linalg::isaContractionOpInterface(linalgOp) &&
@@ -1182,24 +1103,7 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
     return failure();
   }
 
-  // Use IntegerRangeAnalysis to get better bounds for dynamic shapes
-  FailureOr<SmallVector<int64_t>> maybeBounds = 
-      getLoopBoundsWithRangeAnalysis(linalgOp, entryPoint);
-  
-  SmallVector<int64_t> bounds;
-  if (succeeded(maybeBounds)) {
-    bounds = std::move(*maybeBounds);
-    LDBG() << "Using refined bounds from range analysis: [";
-    llvm::interleaveComma(bounds, llvm::dbgs());
-    llvm::dbgs() << "]\n";
-  } else {
-    // Fallback to static loop ranges if analysis fails completely
-    bounds = linalgOp.getStaticLoopRanges();
-    LDBG() << "Fallback to static loop ranges: [";
-    llvm::interleaveComma(bounds, llvm::dbgs());
-    llvm::dbgs() << "]\n";
-  }
-  
+  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
   SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
   SmallVector<Value> operands(linalgOp->getOperands());
 
@@ -1212,6 +1116,8 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
                         checkForDPSOperandComputeOpProducers(linalgOp);
   }
 
+  // Detect if the matmul is accumulating (reads existing accumulator from
+  // global memory). This affects shared memory usage for scaled MMA operations.
   bool hasExistingAccumulator = isValidInPlaceAccumulatingOp(
       cast<DestinationStyleOpInterface>(linalgOp.getOperation()));
 
@@ -1221,7 +1127,11 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
           /*scaled=*/false, splitReductionTripCnt, cPromoteIfPadding,
           hasExistingAccumulator);
 
+  // TODO (muzasyed) : add generalization for scaled and nonscaled versions of
+  // matmul lowering.
   if (failed(configAndWgSize)) {
+    // TODO (muzasyed) : Perform padding appropriately for minimizing bank
+    // conflicts when dealing with scaled matmuls. For now it is disabled.
     useDirectLoad = true;
     configAndWgSize = getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
         bounds, maps, operands, target, useDirectLoad, /*isGemm=*/true,
@@ -1232,7 +1142,6 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   if (failed(configAndWgSize)) {
     return failure();
   }
-  
   std::array<int64_t, 3> workgroupSize = {configAndWgSize->second, 1, 1};
   LoweringConfigAttr loweringConfig = configAndWgSize->first;
 
@@ -1248,85 +1157,12 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
       DictionaryAttr::get(linalgOp->getContext(), pipelineAttrs);
   const int64_t targetSubgroupSize = target.getPreferredSubgroupSize();
 
+  // TODO(qedawkins): Use a shared pipeline identifier here.
   return setOpConfigAndEntryPointFnTranslation(
       entryPoint, op, loweringConfig,
       IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUTileAndFuse,
       workgroupSize, targetSubgroupSize, pipelineConfig);
 }
-
-
-
-// LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
-//                                       mlir::FunctionOpInterface entryPoint,
-//                                       Operation *op, bool useDirectLoad) {
-//                                         llvm::dbgs() << "setMatmulLoweringConfig called \n";
-//   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-//   if (!linalgOp ||
-//       (!linalg::isaContractionOpInterface(linalgOp) &&
-//        !IREE::LinalgExt::isaScaledContractionOpInterface(linalgOp))) {
-//     return failure();
-//   }
-
-//   SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
-//   SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
-//   SmallVector<Value> operands(linalgOp->getOperands());
-
-//   const int64_t splitReductionTripCnt = getSplitReductionTripCount(entryPoint);
-
-//   LDBG() << "Matmul TileAndFuse Config";
-//   bool cPromoteIfPadding = false;
-//   if (clGPUTestCpromotion) {
-//     cPromoteIfPadding = checkForElementwiseUsersWithNewOperands(linalgOp) ||
-//                         checkForDPSOperandComputeOpProducers(linalgOp);
-//   }
-
-//   // Detect if the matmul is accumulating (reads existing accumulator from
-//   // global memory). This affects shared memory usage for scaled MMA operations.
-//   bool hasExistingAccumulator = isValidInPlaceAccumulatingOp(
-//       cast<DestinationStyleOpInterface>(linalgOp.getOperation()));
-
-//   FailureOr<std::pair<LoweringConfigAttr, int64_t>> configAndWgSize =
-//       getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
-//           bounds, maps, operands, target, useDirectLoad, /*isGemm=*/true,
-//           /*scaled=*/false, splitReductionTripCnt, cPromoteIfPadding,
-//           hasExistingAccumulator);
-
-//   // TODO (muzasyed) : add generalization for scaled and nonscaled versions of
-//   // matmul lowering.
-//   if (failed(configAndWgSize)) {
-//     // TODO (muzasyed) : Perform padding appropriately for minimizing bank
-//     // conflicts when dealing with scaled matmuls. For now it is disabled.
-//     useDirectLoad = true;
-//     configAndWgSize = getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
-//         bounds, maps, operands, target, useDirectLoad, /*isGemm=*/true,
-//         /*scaled=*/true, splitReductionTripCnt, cPromoteIfPadding,
-//         hasExistingAccumulator);
-//   }
-
-//   if (failed(configAndWgSize)) {
-//     return failure();
-//   }
-//   std::array<int64_t, 3> workgroupSize = {configAndWgSize->second, 1, 1};
-//   LoweringConfigAttr loweringConfig = configAndWgSize->first;
-
-//   SmallVector<NamedAttribute, 1> pipelineAttrs;
-//   auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
-//       linalgOp->getContext(), /*prefetchNumStages=*/2,
-//       /*no_reduce_shared_memory_bank_conflicts=*/useDirectLoad,
-//       /*use_igemm_convolution=*/false,
-//       /*reorder_workgroups_strategy=*/std::nullopt);
-//   pipelineAttrs.emplace_back(
-//       IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions);
-//   auto pipelineConfig =
-//       DictionaryAttr::get(linalgOp->getContext(), pipelineAttrs);
-//   const int64_t targetSubgroupSize = target.getPreferredSubgroupSize();
-
-//   // TODO(qedawkins): Use a shared pipeline identifier here.
-//   return setOpConfigAndEntryPointFnTranslation(
-//       entryPoint, op, loweringConfig,
-//       IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUTileAndFuse,
-//       workgroupSize, targetSubgroupSize, pipelineConfig);
-// }
 
 /// Helper to identify contraction like operations for operand promotiong.
 static bool isNonMatvecContraction(Operation *op) {
