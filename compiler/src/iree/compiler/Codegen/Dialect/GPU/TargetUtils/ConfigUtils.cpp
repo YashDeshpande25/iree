@@ -1104,11 +1104,75 @@ workgroupSize, targetSubgroupSize, pipelineConfig);
 
 
 /// Helper function to get bounds using IntegerRangeAnalysis
+// static FailureOr<SmallVector<int64_t>> 
+// getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp, 
+//                                mlir::FunctionOpInterface entryPoint) {
+//   // MLIRContext *context = linalgOp.getContext();
+//   // Create DataFlowSolver and run IntegerRangeAnalysis
+//   DataFlowSolver solver;
+//   solver.load<dataflow::DeadCodeAnalysis>();
+//   solver.load<dataflow::SparseConstantPropagation>();
+//   solver.load<dataflow::IntegerRangeAnalysis>();
+  
+//   if (failed(solver.initializeAndRun(entryPoint))) {
+//     LDBG() << "Failed to run integer range analysis, falling back to static bounds";
+//     return linalgOp.getStaticLoopRanges();
+//   }
+  
+//   SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+//   OpBuilder builder(linalgOp);  // ✅ Persistent OpBuilder object
+// SmallVector<OpFoldResult> loopRanges = linalgOp.createFlatListOfOperandDims(
+//     builder, linalgOp.getLoc());
+//   // Try to refine dynamic bounds using range analysis
+//   for (auto [idx, bound] : llvm::enumerate(bounds)) {
+//     if (!ShapedType::isDynamic(bound)) {
+//       continue; // Keep static bounds as-is
+//     }
+    
+//     // Get the Value representing this dimension
+//     if (idx >= loopRanges.size()) {
+//       llvm::dbgs()<< "Index " << idx << " out of range for loop ranges, using INT64_MAX";
+//       bounds[idx] = std::numeric_limits<int64_t>::max();
+//       continue;
+//     }
+    
+//     auto dimValue = dyn_cast_if_present<Value>(loopRanges[idx]);
+//     if (!dimValue) {
+//       LDBG() << "Could not get Value for dimension " << idx << ", using INT64_MAX";
+//       bounds[idx] = std::numeric_limits<int64_t>::max();
+//       continue;
+//     }
+    
+//     // Use getDynamicUpperBound helper (similar to ROCDLConfigureBufferInstructions)
+//     FailureOr<int64_t> upperBound = getDynamicUpperBound(dimValue, solver);
+    
+//     if (succeeded(upperBound)) {
+//       int64_t constantBound = *upperBound;
+//       // Sanity check: ensure bound is reasonable
+//       if (constantBound > 0 && constantBound < std::numeric_limits<int64_t>::max()) {
+//         bounds[idx] = constantBound;
+//         LDBG() << "Refined bound for dim " << idx << " from dynamic to " 
+//                << constantBound << " using getDynamicUpperBound";
+//       } else {
+//         LDBG() << "Upper bound for dim " << idx << " is unreasonable (" 
+//                << constantBound << "), using INT64_MAX";
+//         bounds[idx] = std::numeric_limits<int64_t>::max();
+//       }
+//     } else {
+//       // getDynamicUpperBound failed, use INT64_MAX as fallback
+//       llvm::dbgs() << "getDynamicUpperBound failed for dim " << idx 
+//              << ", using INT64_MAX";
+//       bounds[idx] = std::numeric_limits<int64_t>::max();
+//     }
+//   }
+  
+//   return bounds;
+// }
+
+/// Helper function to get bounds using IntegerRangeAnalysis
 static FailureOr<SmallVector<int64_t>> 
 getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp, 
                                mlir::FunctionOpInterface entryPoint) {
-  // MLIRContext *context = linalgOp.getContext();
-  // Create DataFlowSolver and run IntegerRangeAnalysis
   DataFlowSolver solver;
   solver.load<dataflow::DeadCodeAnalysis>();
   solver.load<dataflow::SparseConstantPropagation>();
@@ -1120,49 +1184,53 @@ getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
   }
   
   SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
-  OpBuilder builder(linalgOp);  // ✅ Persistent OpBuilder object
-SmallVector<OpFoldResult> loopRanges = linalgOp.createFlatListOfOperandDims(
-    builder, linalgOp.getLoc());
-  // Try to refine dynamic bounds using range analysis
-  for (auto [idx, bound] : llvm::enumerate(bounds)) {
+  SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
+  
+  // Walk backwards through the IR to find dimension-defining values
+  for (auto [loopIdx, bound] : llvm::enumerate(bounds)) {
     if (!ShapedType::isDynamic(bound)) {
-      continue; // Keep static bounds as-is
-    }
-    
-    // Get the Value representing this dimension
-    if (idx >= loopRanges.size()) {
-      LDBG() << "Index " << idx << " out of range for loop ranges, using INT64_MAX";
-      bounds[idx] = std::numeric_limits<int64_t>::max();
       continue;
     }
     
-    auto dimValue = dyn_cast_if_present<Value>(loopRanges[idx]);
-    if (!dimValue) {
-      LDBG() << "Could not get Value for dimension " << idx << ", using INT64_MAX";
-      bounds[idx] = std::numeric_limits<int64_t>::max();
-      continue;
-    }
-    
-    // Use getDynamicUpperBound helper (similar to ROCDLConfigureBufferInstructions)
-    FailureOr<int64_t> upperBound = getDynamicUpperBound(dimValue, solver);
-    
-    if (succeeded(upperBound)) {
-      int64_t constantBound = *upperBound;
-      // Sanity check: ensure bound is reasonable
-      if (constantBound > 0 && constantBound < std::numeric_limits<int64_t>::max()) {
-        bounds[idx] = constantBound;
-        LDBG() << "Refined bound for dim " << idx << " from dynamic to " 
-               << constantBound << " using getDynamicUpperBound";
-      } else {
-        LDBG() << "Upper bound for dim " << idx << " is unreasonable (" 
-               << constantBound << "), using INT64_MAX";
-        bounds[idx] = std::numeric_limits<int64_t>::max();
+    // Find operand and dimension that corresponds to this loop
+    for (auto [operandIdx, operand] : llvm::enumerate(linalgOp->getOperands())) {
+      auto shapedType = dyn_cast<ShapedType>(operand.getType());
+      if (!shapedType) continue;
+      
+      AffineMap map = indexingMaps[operandIdx];
+      for (auto [dimIdx, expr] : llvm::enumerate(map.getResults())) {
+        auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+        if (!dimExpr || dimExpr.getPosition() != loopIdx) continue;
+        if (!ShapedType::isDynamic(shapedType.getDimSize(dimIdx))) continue;
+        
+        // Look for tensor.dim or the source of the dynamic dimension
+        // by walking the use-def chain
+        Value source = operand;
+        while (source) {
+          if (auto emptyOp = source.getDefiningOp<tensor::EmptyOp>()) {
+            // Get the dynamic dimension operand
+            unsigned dynamicDimIdx = 0;
+            for (unsigned i = 0; i < dimIdx; ++i) {
+              if (ShapedType::isDynamic(shapedType.getDimSize(i))) {
+                dynamicDimIdx++;
+              }
+            }
+            if (dynamicDimIdx < emptyOp.getDynamicSizes().size()) {
+              Value sizeValue = emptyOp.getDynamicSizes()[dynamicDimIdx];
+              FailureOr<int64_t> upperBound = getDynamicUpperBound(sizeValue, solver);
+              if (succeeded(upperBound) && *upperBound > 0 && 
+                  *upperBound < std::numeric_limits<int64_t>::max()) {
+                bounds[loopIdx] = *upperBound;
+                llvm::dbgs() << "Refined bound for loop dim " << loopIdx 
+                             << " to " << *upperBound << "\n";
+              }
+            }
+            break;
+          }
+          // Add more cases as needed (e.g., tensor.cast, etc.)
+          source = nullptr;
+        }
       }
-    } else {
-      // getDynamicUpperBound failed, use INT64_MAX as fallback
-      LDBG() << "getDynamicUpperBound failed for dim " << idx 
-             << ", using INT64_MAX";
-      bounds[idx] = std::numeric_limits<int64_t>::max();
     }
   }
   
@@ -1181,7 +1249,16 @@ if (!linalgOp ||
 return failure();
 }
 
+  ///////////////////////////////////////////////////////////////////////////
   // SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+  // llvm::dbgs()<<"Static Bounds Calculated\n";
+  //   for (auto bound : bounds) {
+  //     llvm::dbgs()<<bound<<" ";
+  //   }
+  //   llvm::dbgs()<<"\n";
+  ///////////////////////////////////////////////////////////////////////////
+
+  ///////////////////////////////////////////////////////////////////////////
   // Use IntegerRangeAnalysis to get better bounds for dynamic shapes
   FailureOr<SmallVector<int64_t>> maybeBounds = 
       getLoopBoundsWithRangeAnalysis(linalgOp, entryPoint);
@@ -1204,7 +1281,9 @@ return failure();
     llvm::interleaveComma(bounds, llvm::dbgs());
     llvm::dbgs() << "]\n";
   }
-  
+  ///////////////////////////////////////////////////////////////////////////////
+
+
 SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
 SmallVector<Value> operands(linalgOp->getOperands());
 
