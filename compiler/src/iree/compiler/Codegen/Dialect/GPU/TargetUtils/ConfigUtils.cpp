@@ -352,6 +352,7 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
     bool transposedLhs, bool transposedRhs, bool isGemm,
     bool mustBeAligned = true, bool doCPromotion = false, bool scaled = false,
     int64_t splitReductionTripCnt = 0) {
+      llvm::dbgs()<<"getMmaScheduleFromProblemAndTarget called\n";
   const int64_t targetSubgroupSize = target.getPreferredSubgroupSize();
   SmallVector<GPUIntrinsicType> intrinsics;
   if (scaled) {
@@ -408,6 +409,8 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
 
   int64_t flops = (2 * mSize * nSize * kSize);
   int64_t bytes = (mSize * nSize + nSize * kSize + mSize * kSize);
+
+  llvm::dbgs()<<"Bytes are "<<bytes<<"\n";
 
   // Only support blocking along the last dimension for now.
   int64_t outerK = (kSize / problem.kSizes.back());
@@ -663,7 +666,7 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     ArrayRef<int64_t> bounds, ArrayRef<AffineMap> maps,
     ArrayRef<Value> operands, IREE::GPU::TargetAttr target, bool useDirectLoad,
     bool isGemm, bool scaled, int64_t splitReductionTripCnt,
-    bool cPromoteIfPadding, bool hasExistingAccumulator = false,
+    bool cPromoteIfPadding, bool boundsUsingAnalysis, bool hasExistingAccumulator = false,
     std::optional<ConvToIgemmInfo> convToIgemmInfo = std::nullopt) {
   llvm::dbgs() << "getMatmulOrIGEMMLoweringConfigAndWorkgroupSize called\n";
   if (target.getWgp().getMma().empty()) {
@@ -704,8 +707,15 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
   if (ShapedType::isDynamic(bounds[contractionM.back()]) ||
       ShapedType::isDynamic(bounds[contractionN.back()]) ||
       ShapedType::isDynamic(bounds[contractionK.back()])) {
+        llvm::dbgs()<<"There's still dynamic dims in there\n";
     return failure();
   }
+  llvm::dbgs()<<"All dynamic dims have been replaced\n";
+  llvm::dbgs()<<"Inside getMatmulOrIGEMMLoweringConfigAndWorkgroupSize, bounds are [";
+  for(auto dbound: bounds) {
+    llvm::dbgs()<<dbound<<", ";
+  }
+  llvm::dbgs()<<"]\n";
 
   // We can support unaligned shapes as long as there are no dynamic dimensions
   // as finding padding bounds for dynamic dimensions is not guaranteed.
@@ -722,6 +732,7 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
       canSupportUnaligned = false;
       continue;
     }
+    llvm::dbgs()<<"M bound is NOT dynamic\n";
     mDims.push_back(mDim);
   }
   for (int64_t nDim : contractionN) {
@@ -790,12 +801,15 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     return llvm::map_to_vector(dims, [&](int64_t dim) {
       if (ShapedType::isDynamic(bounds[dim]) || !canSupportUnaligned ||
           paddingCanBeExpensive) {
+           llvm::dbgs()<<"I am using original value\n"; 
         return bounds[dim];
       }
       if (bounds[dim] > 128) {
+        llvm::dbgs()<<"I am using 128\n";
         return maybePaddedBounds(bounds[dim], 128);
       }
       if (bounds[dim] > 32) {
+        llvm::dbgs()<<"I am using 32\n";
         return maybePaddedBounds(bounds[dim], 32);
       }
 
@@ -959,7 +973,9 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
                                            : ArrayRef<Attribute>{};
   GPU::appendPromotedOperandsList(context, attrs, promotionList,
                                   promotionTypes);
-  if (!mustBeAligned || couldNeedPadding) {
+  if (!mustBeAligned || couldNeedPadding || boundsUsingAnalysis) {
+  // Add an extra variable/parameter to tell that the bounds are from the analysis.
+  // if(1) {
     SmallVector<int64_t> paddingTileSizes = workgroupTileSizes;
 
     // Initialize inner and outer padding sizes from reductionTileSizes.
@@ -1075,7 +1091,7 @@ LogicalResult setIGEMMConvolutionLoweringConfig(
           igemmLoopBounds, igemmContractionMaps, igemmOperands, target,
           useDirectLoad, /*isGemm=*/false,
           /*scaled=*/false, splitReductionTripCnt,
-          /*cPromoteIfPadding=*/cPromoteIfPadding, hasExistingAccumulator,
+          /*cPromoteIfPadding=*/cPromoteIfPadding, /*boundsUsingAnalysis*/ false, hasExistingAccumulator,
           convToIgemmInfo);
   if (failed(configAndWgSize)) {
     return failure();
@@ -1102,282 +1118,278 @@ LogicalResult setIGEMMConvolutionLoweringConfig(
       workgroupSize, targetSubgroupSize, pipelineConfig);
 }
 
-/// Helper function to get bounds using IntegerRangeAnalysis
 // static FailureOr<SmallVector<int64_t>>
-// getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
-//                                mlir::FunctionOpInterface entryPoint) {
-//   // MLIRContext *context = linalgOp.getContext();
-//   // Create DataFlowSolver and run IntegerRangeAnalysis
-//   DataFlowSolver solver;
-//   solver.load<dataflow::DeadCodeAnalysis>();
-//   solver.load<dataflow::SparseConstantPropagation>();
-//   solver.load<dataflow::IntegerRangeAnalysis>();
-
-//   if (failed(solver.initializeAndRun(entryPoint))) {
-//     LDBG() << "Failed to run integer range analysis, falling back to static
-//     bounds"; return linalgOp.getStaticLoopRanges();
-//   }
-
-//   SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
-//   OpBuilder builder(linalgOp);  // ✅ Persistent OpBuilder object
-// SmallVector<OpFoldResult> loopRanges = linalgOp.createFlatListOfOperandDims(
-//     builder, linalgOp.getLoc());
-//   // Try to refine dynamic bounds using range analysis
-//   for (auto [idx, bound] : llvm::enumerate(bounds)) {
-//     if (!ShapedType::isDynamic(bound)) {
-//       continue; // Keep static bounds as-is
+//   getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
+//                                  mlir::FunctionOpInterface entryPoint) {
+//     // Run the comprehensive tensor dimension analysis
+//     TensorDynamicDimAnalysis dynamicDimAnalysis(entryPoint);
+//     if (failed(dynamicDimAnalysis.run())) {
+//       return linalgOp.getStaticLoopRanges();
 //     }
 
-//     // Get the Value representing this dimension
-//     if (idx >= loopRanges.size()) {
-//       llvm::dbgs()<< "Index " << idx << " out of range for loop ranges, using
-//       INT64_MAX"; bounds[idx] = std::numeric_limits<int64_t>::max();
-//       continue;
-//     }
+//     SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+//     SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
 
-//     auto dimValue = dyn_cast_if_present<Value>(loopRanges[idx]);
-//     if (!dimValue) {
-//       LDBG() << "Could not get Value for dimension " << idx << ", using
-//       INT64_MAX"; bounds[idx] = std::numeric_limits<int64_t>::max();
-//       continue;
-//     }
-
-//     // Use getDynamicUpperBound helper (similar to
-//     ROCDLConfigureBufferInstructions) FailureOr<int64_t> upperBound =
-//     getDynamicUpperBound(dimValue, solver);
-
-//     if (succeeded(upperBound)) {
-//       int64_t constantBound = *upperBound;
-//       // Sanity check: ensure bound is reasonable
-//       if (constantBound > 0 && constantBound <
-//       std::numeric_limits<int64_t>::max()) {
-//         bounds[idx] = constantBound;
-//         LDBG() << "Refined bound for dim " << idx << " from dynamic to "
-//                << constantBound << " using getDynamicUpperBound";
-//       } else {
-//         LDBG() << "Upper bound for dim " << idx << " is unreasonable ("
-//                << constantBound << "), using INT64_MAX";
-//         bounds[idx] = std::numeric_limits<int64_t>::max();
-//       }
-//     } else {
-//       // getDynamicUpperBound failed, use INT64_MAX as fallback
-//       llvm::dbgs() << "getDynamicUpperBound failed for dim " << idx
-//              << ", using INT64_MAX";
-//       bounds[idx] = std::numeric_limits<int64_t>::max();
-//     }
-//   }
-
-//   return bounds;
-// }
-
-/// Helper function to get bounds using IntegerRangeAnalysis
-// static FailureOr<SmallVector<int64_t>>
-// getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
-//                                mlir::FunctionOpInterface entryPoint) {
-//   DataFlowSolver solver;
-//   solver.load<dataflow::DeadCodeAnalysis>();
-//   solver.load<dataflow::SparseConstantPropagation>();
-//   solver.load<dataflow::IntegerRangeAnalysis>();
-
-//   if (failed(solver.initializeAndRun(entryPoint))) {
-//     LDBG() << "Failed to run integer range analysis, falling back to static "
-//               "bounds";
-//     return linalgOp.getStaticLoopRanges();
-//   }
-
-//   SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
-//   SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
-
-//   // Walk backwards through the IR to find dimension-defining values
-//   for (auto [loopIdx, bound] : llvm::enumerate(bounds)) {
-//     if (!ShapedType::isDynamic(bound)) {
-//       continue;
-//     }
-
-//     // Find operand and dimension that corresponds to this loop
-//     for (auto [operandIdx, operand] :
-//          llvm::enumerate(linalgOp->getOperands())) {
-//       auto shapedType = dyn_cast<ShapedType>(operand.getType());
-//       if (!shapedType) {
+//     for (auto [loopIdx, bound] : llvm::enumerate(bounds)) {
+//       if (!ShapedType::isDynamic(bound)) {
 //         continue;
 //       }
 
-//       AffineMap map = indexingMaps[operandIdx];
-//       for (auto [dimIdx, expr] : llvm::enumerate(map.getResults())) {
-//         auto dimExpr = dyn_cast<AffineDimExpr>(expr);
-//         if (!dimExpr || dimExpr.getPosition() != loopIdx) {
-//           continue;
-//         }
-//         if (!ShapedType::isDynamic(shapedType.getDimSize(dimIdx))) {
-//           continue;
-//         }
+//       // Find operand and dimension that corresponds to this loop
+//       for (auto [operandIdx, operand] : llvm::enumerate(linalgOp->getOperands())) {
+//         auto shapedType = dyn_cast<ShapedType>(operand.getType());
+//         if (!shapedType) continue;
 
-//         // Look for tensor.dim or the source of the dynamic dimension
-//         // by walking the use-def chain
-//         Value source = operand;
-//         while (source) {
-//           if (auto emptyOp = source.getDefiningOp<tensor::EmptyOp>()) {
-//             // Get the dynamic dimension operand
-//             unsigned dynamicDimIdx = 0;
-//             for (unsigned i = 0; i < dimIdx; ++i) {
-//               if (ShapedType::isDynamic(shapedType.getDimSize(i))) {
-//                 dynamicDimIdx++;
-//               }
+//         AffineMap map = indexingMaps[operandIdx];
+//         for (auto [dimIdx, expr] : llvm::enumerate(map.getResults())) {
+//           auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+//           if (!dimExpr || dimExpr.getPosition() != loopIdx) continue;
+//           if (!ShapedType::isDynamic(shapedType.getDimSize(dimIdx))) continue;
+
+//           // Use TensorDynamicDimAnalysis to get range information
+//           std::optional<ConstantIntRanges> rangeInfo =
+//               dynamicDimAnalysis.getRangeInfo(operand, dimIdx);
+
+//           if (rangeInfo) {
+//             // Get the unsigned maximum (upper bound)
+//             const APInt &umax = rangeInfo->umax();
+//             if (umax.isStrictlyPositive() &&
+//                 umax.ult(std::numeric_limits<int64_t>::max())) {
+//               bounds[loopIdx] = umax.getSExtValue();
+//               llvm::dbgs() << "Refined bound for loop dim " << loopIdx
+//                            << " to " << bounds[loopIdx]
+//                            << " (from TensorDynamicDimAnalysis)\n";
+//               break;
 //             }
-//             if (dynamicDimIdx < emptyOp.getDynamicSizes().size()) {
-//               Value sizeValue = emptyOp.getDynamicSizes()[dynamicDimIdx];
-//               FailureOr<int64_t> upperBound = getDynamicUpperBound(sizeValue,
-//               solver); if (succeeded(upperBound) && *upperBound > 0 &&
-//                   *upperBound < std::numeric_limits<int64_t>::max()) {
-//                 bounds[loopIdx] = *upperBound;
-//                 llvm::dbgs() << "Refined bound for loop dim " << loopIdx
-//                              << " to " << *upperBound << "\n";
-//               }
-//             }
-//             break;
 //           }
-//           // Add more cases as needed (e.g., tensor.cast, etc.)
-//           source = nullptr;
 //         }
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// REIFY LOGIC
-        // // Look for the source of the dynamic dimension by walking the use-def
-        // // chain Look for the source of the dynamic dimension by walking the
-        // // use-def chain
-        // Value source = operand;
-        // OpBuilder builder(linalgOp->getContext());
-        // builder.setInsertionPoint(linalgOp);
-
-        // while (source) {
-        //   Operation *defOp = source.getDefiningOp();
-        //   if (!defOp) {
-        //     // Could be a block argument - trace it if needed
-        //     break;
-        //   }
-
-        //   // Try using the ReifyRankedShapedTypeOpInterface for generality
-        //   if (auto shapeOp =
-        //           dyn_cast<ReifyRankedShapedTypeOpInterface>(defOp)) {
-        //     // Find which result of the operation produced our value
-        //     unsigned resultIdx = 0;
-        //     for (auto [idx, result] : llvm::enumerate(defOp->getResults())) {
-        //       if (result == source) {
-        //         resultIdx = idx;
-        //         break;
-        //       }
-        //     }
-
-        //     // Reify the shape dimensions for all results
-        //     ReifiedRankedShapedTypeDims resultShapes;
-        //     if (succeeded(shapeOp.reifyResultShapes(builder, resultShapes))) {
-        //       // Get the dimensions for our specific result
-        //       if (resultIdx < resultShapes.size() &&
-        //           dimIdx < resultShapes[resultIdx].size()) {
-        //         OpFoldResult dimResult = resultShapes[resultIdx][dimIdx];
-
-        //         // OpFoldResult can be either a Value or an Attribute
-        //         Value sizeValue;
-        //         if (auto attr = dyn_cast<Attribute>(dimResult)) {
-        //           // It's a constant - we could extract it directly
-        //           if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
-        //             int64_t staticSize = intAttr.getInt();
-        //             if (staticSize > 0 &&
-        //                 staticSize < std::numeric_limits<int64_t>::max()) {
-        //               bounds[loopIdx] = staticSize;
-        //               llvm::dbgs() << "Refined bound for loop dim " << loopIdx
-        //                            << " to " << staticSize << " (static)\n";
-        //             }
-        //           }
-        //           break;
-        //         } else {
-        //           // It's a runtime Value
-        //           sizeValue = cast<Value>(dimResult);
-        //         }
-
-        //         // Try to get an upper bound for this dimension
-        //         if (sizeValue) {
-        //           FailureOr<int64_t> upperBound =
-        //               getDynamicUpperBound(sizeValue, solver);
-        //           if (succeeded(upperBound) && *upperBound > 0 &&
-        //               *upperBound < std::numeric_limits<int64_t>::max()) {
-        //             bounds[loopIdx] = *upperBound;
-        //             llvm::dbgs() << "Refined bound for loop dim " << loopIdx
-        //                          << " to " << *upperBound << "\n";
-        //           }
-        //         }
-        //       }
-        //     }
-        //     break;
-        //   }
-
-        //   // Handle tensor.cast and similar ops that just propagate shapes
-        //   if (auto castOp = dyn_cast<tensor::CastOp>(defOp)) {
-        //     source = castOp.getSource();
-        //     continue;
-        //   }
-
-        //   // If we can't handle this operation, stop
-        //   source = nullptr;
-        // }
 //       }
 //     }
+
+//     return bounds;
+//   }
+//////////////////////////////////////////////////////////////////////////////////////////
+// static FailureOr<SmallVector<int64_t>>                                                                                            
+//   getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
+//                                         mlir::FunctionOpInterface entryPoint) {                                                     
+//     // Initialize DataFlowSolver for integer range analysis
+//     DataFlowSolver solver;
+//     solver.load<dataflow::DeadCodeAnalysis>();
+//     solver.load<dataflow::SparseConstantPropagation>();
+//     solver.load<dataflow::IntegerRangeAnalysis>();
+
+//     if (failed(solver.initializeAndRun(entryPoint))) {
+//       return linalgOp.getStaticLoopRanges();
+//     }
+
+//     SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+//     SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
+
+//     OpBuilder builder(linalgOp.getContext());
+//     builder.setInsertionPoint(linalgOp);
+
+//     // Compute the largest power of 2 that fits in int64_t
+//     // int64_t has (sizeof(int64_t) * 8) bits total
+//     // With 1 sign bit, we have (sizeof(int64_t) * 8 - 1) bits for magnitude
+//     // Largest power of 2 is 2^((sizeof(int64_t) * 8) - 2)
+//     constexpr int64_t bitWidth = sizeof(int64_t) * 8;
+//     constexpr int64_t maxPowerOfTwo = int64_t{1} << (bitWidth - 2);
+
+//     for (auto [loopIdx, bound] : llvm::enumerate(bounds)) {
+//       if (!ShapedType::isDynamic(bound)) {
+//         continue;
+//       }
+//       llvm::dbgs()<<"Bound Index = "<<loopIdx<<"is dynamic\n";
+
+//       bool boundRefined = false;
+
+//       // Find operand and dimension that corresponds to this loop
+//       for (auto [operandIdx, operand] :
+//            llvm::enumerate(linalgOp->getOperands())) {
+//         auto shapedType = dyn_cast<ShapedType>(operand.getType());
+//         if (!shapedType)
+//           continue;
+
+//         AffineMap map = indexingMaps[operandIdx];
+//         for (auto [dimIdx, expr] : llvm::enumerate(map.getResults())) {
+//           auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+//           if (!dimExpr || dimExpr.getPosition() != loopIdx)
+//             continue;
+//           if (!ShapedType::isDynamic(shapedType.getDimSize(dimIdx)))
+//             continue;
+
+//           // Generalized: handle both tensors and memrefs
+//           SmallVector<OpFoldResult> mixedSizes;
+//           if (isa<RankedTensorType>(shapedType)) {
+//             llvm::dbgs()<<"It is a tensor type\n";
+//             mixedSizes = tensor::getMixedSizes(builder, linalgOp.getLoc(), operand);
+//           } else if (isa<MemRefType>(shapedType)) {
+//             mixedSizes = memref::getMixedSizes(builder, linalgOp.getLoc(),
+//                                                 cast<TypedValue<MemRefType>>(operand));
+//           } else {
+//             continue;
+//           }
+
+//           OpFoldResult dimResult = mixedSizes[dimIdx];
+
+//           if (auto dimValue = dyn_cast<Value>(dimResult)) {
+//             FailureOr<int64_t> ub = getDynamicUpperBound(dimValue, solver);
+//             if (succeeded(ub) && *ub > 0) {
+//               bounds[loopIdx] = *ub;
+//               llvm::dbgs() << "Refined bound for loop dim " << loopIdx
+//                            << " to " << bounds[loopIdx] << "\n";
+//               boundRefined = true;
+//               break;
+//             }
+//           }
+//         }
+
+//         if (boundRefined) {
+//           break;
+//         }
+//       }
+
+//       // If we couldn't refine the bound, set it to the largest power of 2
+//       if (!boundRefined && ShapedType::isDynamic(bounds[loopIdx])) {
+//         bounds[loopIdx] = maxPowerOfTwo;
+//         llvm::dbgs() << "Could not refine bound for loop dim " << loopIdx
+//                      << ", using max power of 2: " << maxPowerOfTwo << "\n";
+//       }
+//     }
+
+//     return bounds;
 //   }
 
-//   return bounds;
-// }
 
 
-static FailureOr<SmallVector<int64_t>>
+static FailureOr<SmallVector<int64_t>>                                                                                                                                                                                                                                     
   getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
                                  mlir::FunctionOpInterface entryPoint) {
-    // Run the comprehensive tensor dimension analysis
-    TensorDynamicDimAnalysis dynamicDimAnalysis(entryPoint);
-    if (failed(dynamicDimAnalysis.run())) {
+    // Initialize DataFlowSolver for integer range analysis
+    DataFlowSolver solver;
+    solver.load<dataflow::DeadCodeAnalysis>();
+    solver.load<dataflow::SparseConstantPropagation>();
+    solver.load<dataflow::IntegerRangeAnalysis>();
+
+    if (failed(solver.initializeAndRun(entryPoint))) {
       return linalgOp.getStaticLoopRanges();
     }
 
     SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
     SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
 
+    // Compute the largest power of 2 that fits in int64_t
+    constexpr int64_t bitWidth = sizeof(int64_t) * 8;
+    constexpr int64_t maxPowerOfTwo = int64_t{1} << (bitWidth - 2);
+
+    // Sentinel value used by IntegerRangeAnalysis when bounds are unknown
+    // This is 2^53 - 1, used as "unbounded"
+    constexpr int64_t unboundedSentinel = 9007199254740991;
+
+    // Helper to recursively collect index values from an operation
+    std::function<void(Value, SmallVectorImpl<Value> &, int)> collectIndexValues =
+      [&](Value value, SmallVectorImpl<Value> &indexValues, int depth) -> void {
+      if (depth > 10) return; // Prevent infinite recursion
+
+      if (value.getType().isIndex()) {
+        indexValues.push_back(value);
+      }
+
+      Operation *defOp = value.getDefiningOp();
+      if (!defOp) return;
+
+      // Recursively traverse all operands
+      for (Value operand : defOp->getOperands()) {
+        if (operand.getType().isIndex()) {
+          indexValues.push_back(operand);
+        }
+        // Continue traversing for shaped types to find their dimension operands
+        if (isa<ShapedType>(operand.getType())) {
+          Operation *operandDef = operand.getDefiningOp();
+          if (operandDef) {
+            for (Value v : operandDef->getOperands()) {
+              if (v.getType().isIndex()) {
+                collectIndexValues(v, indexValues, depth + 1);
+              }
+            }
+          }
+        }
+      }
+    };
+
     for (auto [loopIdx, bound] : llvm::enumerate(bounds)) {
       if (!ShapedType::isDynamic(bound)) {
         continue;
       }
+      llvm::dbgs() << "Bound Index = " << loopIdx << " is dynamic\n";
+
+      bool boundRefined = false;
 
       // Find operand and dimension that corresponds to this loop
-      for (auto [operandIdx, operand] : llvm::enumerate(linalgOp->getOperands())) {
+      for (auto [operandIdx, operand] :
+           llvm::enumerate(linalgOp->getOperands())) {
         auto shapedType = dyn_cast<ShapedType>(operand.getType());
-        if (!shapedType) continue;
+        if (!shapedType)
+          continue;
 
         AffineMap map = indexingMaps[operandIdx];
         for (auto [dimIdx, expr] : llvm::enumerate(map.getResults())) {
           auto dimExpr = dyn_cast<AffineDimExpr>(expr);
-          if (!dimExpr || dimExpr.getPosition() != loopIdx) continue;
-          if (!ShapedType::isDynamic(shapedType.getDimSize(dimIdx))) continue;
+          if (!dimExpr || dimExpr.getPosition() != loopIdx)
+            continue;
+          if (!ShapedType::isDynamic(shapedType.getDimSize(dimIdx)))
+            continue;
 
-          // Use TensorDynamicDimAnalysis to get range information
-          std::optional<ConstantIntRanges> rangeInfo =
-              dynamicDimAnalysis.getRangeInfo(operand, dimIdx);
+          // Collect all index values related to this operand by traversing use-def chain
+          SmallVector<Value> indexValues;
+          collectIndexValues(operand, indexValues, 0);
 
-          if (rangeInfo) {
-            // Get the unsigned maximum (upper bound)
-            const APInt &umax = rangeInfo->umax();
-            if (umax.isStrictlyPositive() &&
-                umax.ult(std::numeric_limits<int64_t>::max())) {
-              bounds[loopIdx] = umax.getSExtValue();
+          // Try each index value with getDynamicUpperBound
+          for (Value indexValue : indexValues) {
+            FailureOr<int64_t> ub = getDynamicUpperBound(indexValue, solver);
+            if (succeeded(ub) && *ub > 0) {
+              // Filter out the unbounded sentinel - if the analysis returns this,
+              // it means the bound is unknown, so we should use maxPowerOfTwo instead
+              if (*ub >= unboundedSentinel) {
+                llvm::dbgs() << "  Found unbounded sentinel " << *ub
+                             << ", skipping\n";
+                continue;
+              }
+
+              bounds[loopIdx] = *ub;
               llvm::dbgs() << "Refined bound for loop dim " << loopIdx
-                           << " to " << bounds[loopIdx]
-                           << " (from TensorDynamicDimAnalysis)\n";
+                           << " to " << bounds[loopIdx] << "\n";
+              boundRefined = true;
               break;
             }
           }
+
+          if (boundRefined)
+            break;
         }
+
+        if (boundRefined) {
+          break;
+        }
+      }
+
+      // If we couldn't refine the bound, set it to the largest power of 2
+      if (!boundRefined && ShapedType::isDynamic(bounds[loopIdx])) {
+        // bounds[loopIdx] = maxPowerOfTwo;
+        bounds[loopIdx] = 1<<20;
+        llvm::dbgs() << "Could not refine bound for loop dim " << loopIdx
+                     << ", using max power of 2: " << maxPowerOfTwo << "\n";
       }
     }
 
     return bounds;
   }
+
+
+
+
+
+
 
 LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
                                       mlir::FunctionOpInterface entryPoint,
@@ -1401,11 +1413,13 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
 
   ///////////////////////////////////////////////////////////////////////////
   // Use IntegerRangeAnalysis to get better bounds for dynamic shapes
+  bool boundsUsingAnalysis = false;
   FailureOr<SmallVector<int64_t>> maybeBounds =
       getLoopBoundsWithRangeAnalysis(linalgOp, entryPoint);
 
   SmallVector<int64_t> bounds;
   if (succeeded(maybeBounds)) {
+    boundsUsingAnalysis = true;
     bounds = std::move(*maybeBounds);
     llvm::dbgs() << "Dynamic Bounds Calculated\n";
     for (auto bound : bounds) {
@@ -1444,7 +1458,7 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   FailureOr<std::pair<LoweringConfigAttr, int64_t>> configAndWgSize =
       getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
           bounds, maps, operands, target, useDirectLoad, /*isGemm=*/true,
-          /*scaled=*/false, splitReductionTripCnt, cPromoteIfPadding,
+          /*scaled=*/false, splitReductionTripCnt, cPromoteIfPadding, boundsUsingAnalysis, 
           hasExistingAccumulator);
 
   // TODO (muzasyed) : add generalization for scaled and nonscaled versions of
@@ -1455,7 +1469,7 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
     useDirectLoad = true;
     configAndWgSize = getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
         bounds, maps, operands, target, useDirectLoad, /*isGemm=*/true,
-        /*scaled=*/true, splitReductionTripCnt, cPromoteIfPadding,
+        /*scaled=*/true, splitReductionTripCnt, cPromoteIfPadding, boundsUsingAnalysis, 
         hasExistingAccumulator);
   }
 
@@ -1512,8 +1526,8 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
 //   }
 
 //   // Detect if the matmul is accumulating (reads existing accumulator from
-//   // global memory). This affects shared memory usage for scaled MMA
-//   operations. bool hasExistingAccumulator = isValidInPlaceAccumulatingOp(
+//   // global memory). This affects shared memory usage for scaled MMA operations. 
+//   bool hasExistingAccumulator = isValidInPlaceAccumulatingOp(
 //       cast<DestinationStyleOpInterface>(linalgOp.getOperation()));
 
 //   FailureOr<std::pair<LoweringConfigAttr, int64_t>> configAndWgSize =
@@ -1522,8 +1536,7 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
 //           /*scaled=*/false, splitReductionTripCnt, cPromoteIfPadding,
 //           hasExistingAccumulator);
 
-//   // TODO (muzasyed) : add generalization for scaled and nonscaled versions
-//   of
+//   // TODO (muzasyed) : add generalization for scaled and nonscaled versions of
 //   // matmul lowering.
 //   if (failed(configAndWgSize)) {
 //     // TODO (muzasyed) : Perform padding appropriately for minimizing bank
