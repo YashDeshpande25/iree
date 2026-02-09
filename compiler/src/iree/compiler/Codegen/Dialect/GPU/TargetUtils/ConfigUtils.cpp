@@ -38,6 +38,8 @@
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "iree/compiler/Codegen/Common/TensorDynamicDimAnalysis.h"
+#include "llvm/ADT/DenseSet.h"
+#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 ///////////////////////////////////////////////////////
 
 #define DEBUG_TYPE "iree-gpu-config-utils"
@@ -1262,9 +1264,133 @@ LogicalResult setIGEMMConvolutionLoweringConfig(
 
 
 
-static FailureOr<SmallVector<int64_t>>                                                                                                                                                                                                                                     
-  getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
-                                 mlir::FunctionOpInterface entryPoint) {
+// static FailureOr<SmallVector<int64_t>>                                                                                                                                                                                                                                     
+//   getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
+//                                  mlir::FunctionOpInterface entryPoint) {
+//     // Initialize DataFlowSolver for integer range analysis
+//     DataFlowSolver solver;
+//     solver.load<dataflow::DeadCodeAnalysis>();
+//     solver.load<dataflow::SparseConstantPropagation>();
+//     solver.load<dataflow::IntegerRangeAnalysis>();
+
+//     if (failed(solver.initializeAndRun(entryPoint))) {
+//       return linalgOp.getStaticLoopRanges();
+//     }
+
+//     SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+//     SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
+
+//     // Compute the largest power of 2 that fits in int64_t
+//     constexpr int64_t bitWidth = sizeof(int64_t) * 8;
+//     constexpr int64_t maxPowerOfTwo = int64_t{1} << (bitWidth - 2);
+
+//     // Sentinel value used by IntegerRangeAnalysis when bounds are unknown
+//     // This is 2^53 - 1, used as "unbounded"
+//     constexpr int64_t unboundedSentinel = 9007199254740991;
+
+//     // Helper to recursively collect index values from an operation
+//     std::function<void(Value, SmallVectorImpl<Value> &, int)> collectIndexValues =
+//       [&](Value value, SmallVectorImpl<Value> &indexValues, int depth) -> void {
+//       if (depth > 1000) return; // Prevent infinite recursion
+
+//       if (value.getType().isIndex()) {
+//         indexValues.push_back(value);
+//       }
+
+//       Operation *defOp = value.getDefiningOp();
+//       if (!defOp) return;
+
+//       // Recursively traverse all operands
+//       for (Value operand : defOp->getOperands()) {
+//         if (operand.getType().isIndex()) {
+//           indexValues.push_back(operand);
+//         }
+//         // Continue traversing for shaped types to find their dimension operands
+//         if (isa<ShapedType>(operand.getType())) {
+//           Operation *operandDef = operand.getDefiningOp();
+//           if (operandDef) {
+//             for (Value v : operandDef->getOperands()) {
+//               if (v.getType().isIndex()) {
+//                 collectIndexValues(v, indexValues, depth + 1);
+//               }
+//             }
+//           }
+//         }
+//       }
+//     };
+
+//     for (auto [loopIdx, bound] : llvm::enumerate(bounds)) {
+//       if (!ShapedType::isDynamic(bound)) {
+//         continue;
+//       }
+//       llvm::dbgs() << "Bound Index = " << loopIdx << " is dynamic\n";
+
+//       bool boundRefined = false;
+
+//       // Find operand and dimension that corresponds to this loop
+//       for (auto [operandIdx, operand] :
+//            llvm::enumerate(linalgOp->getOperands())) {
+//         auto shapedType = dyn_cast<ShapedType>(operand.getType());
+//         if (!shapedType)
+//           continue;
+
+//         AffineMap map = indexingMaps[operandIdx];
+//         for (auto [dimIdx, expr] : llvm::enumerate(map.getResults())) {
+//           auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+//           if (!dimExpr || dimExpr.getPosition() != loopIdx)
+//             continue;
+//           if (!ShapedType::isDynamic(shapedType.getDimSize(dimIdx)))
+//             continue;
+
+//           // Collect all index values related to this operand by traversing use-def chain
+//           SmallVector<Value> indexValues;
+//           collectIndexValues(operand, indexValues, 0);
+
+//           // Try each index value with getDynamicUpperBound
+//           for (Value indexValue : indexValues) {
+//             FailureOr<int64_t> ub = getDynamicUpperBound(indexValue, solver);
+//             if (succeeded(ub) && *ub > 0) {
+//               // Filter out the unbounded sentinel - if the analysis returns this,
+//               // it means the bound is unknown, so we should use maxPowerOfTwo instead
+//               if (*ub >= unboundedSentinel) {
+//                 llvm::dbgs() << "  Found unbounded sentinel " << *ub
+//                              << ", skipping\n";
+//                 continue;
+//               }
+
+//               bounds[loopIdx] = *ub;
+//               llvm::dbgs() << "Refined bound for loop dim " << loopIdx
+//                            << " to " << bounds[loopIdx] << "\n";
+//               boundRefined = true;
+//               break;
+//             }
+//           }
+
+//           if (boundRefined)
+//             break;
+//         }
+
+//         if (boundRefined) {
+//           break;
+//         }
+//       }
+
+//       // If we couldn't refine the bound, set it to the largest power of 2
+//       if (!boundRefined && ShapedType::isDynamic(bounds[loopIdx])) {
+//         // bounds[loopIdx] = maxPowerOfTwo;
+//         bounds[loopIdx] = 1<<20;
+//         llvm::dbgs() << "Could not refine bound for loop dim " << loopIdx
+//                      << ", using max power of 2: " << maxPowerOfTwo << "\n";
+//       }
+//     }
+
+//     return bounds;
+//   }
+
+
+static FailureOr<SmallVector<int64_t>>
+      getLoopBoundsWithRangeAnalysis(linalg::LinalgOp linalgOp,
+                                     mlir::FunctionOpInterface entryPoint) {
     // Initialize DataFlowSolver for integer range analysis
     DataFlowSolver solver;
     solver.load<dataflow::DeadCodeAnalysis>();
@@ -1283,20 +1409,24 @@ static FailureOr<SmallVector<int64_t>>
     constexpr int64_t maxPowerOfTwo = int64_t{1} << (bitWidth - 2);
 
     // Sentinel value used by IntegerRangeAnalysis when bounds are unknown
-    // This is 2^53 - 1, used as "unbounded"
     constexpr int64_t unboundedSentinel = 9007199254740991;
 
     // Helper to recursively collect index values from an operation
-    std::function<void(Value, SmallVectorImpl<Value> &, int)> collectIndexValues =
-      [&](Value value, SmallVectorImpl<Value> &indexValues, int depth) -> void {
-      if (depth > 10) return; // Prevent infinite recursion
+    // Uses a visited set instead of hardcoded depth limit
+    std::function<void(Value, SmallVectorImpl<Value> &, DenseSet<Value> &)>
+        collectIndexValues = [&](Value value, SmallVectorImpl<Value> &indexValues,
+                                 DenseSet<Value> &visited) -> void {
+      // Use visited set to prevent infinite recursion
+      if (!visited.insert(value).second)
+        return;
 
       if (value.getType().isIndex()) {
         indexValues.push_back(value);
       }
 
       Operation *defOp = value.getDefiningOp();
-      if (!defOp) return;
+      if (!defOp)
+        return;
 
       // Recursively traverse all operands
       for (Value operand : defOp->getOperands()) {
@@ -1309,7 +1439,7 @@ static FailureOr<SmallVector<int64_t>>
           if (operandDef) {
             for (Value v : operandDef->getOperands()) {
               if (v.getType().isIndex()) {
-                collectIndexValues(v, indexValues, depth + 1);
+                collectIndexValues(v, indexValues, visited);
               }
             }
           }
@@ -1342,14 +1472,15 @@ static FailureOr<SmallVector<int64_t>>
 
           // Collect all index values related to this operand by traversing use-def chain
           SmallVector<Value> indexValues;
-          collectIndexValues(operand, indexValues, 0);
+          DenseSet<Value> visited;
+          collectIndexValues(operand, indexValues, visited);
+          llvm::dbgs()<<indexValues.size()<<" number of index values collected\n";
 
           // Try each index value with getDynamicUpperBound
           for (Value indexValue : indexValues) {
             FailureOr<int64_t> ub = getDynamicUpperBound(indexValue, solver);
             if (succeeded(ub) && *ub > 0) {
-              // Filter out the unbounded sentinel - if the analysis returns this,
-              // it means the bound is unknown, so we should use maxPowerOfTwo instead
+              // Filter out the unbounded sentinel
               if (*ub >= unboundedSentinel) {
                 llvm::dbgs() << "  Found unbounded sentinel " << *ub
                              << ", skipping\n";
@@ -1375,8 +1506,7 @@ static FailureOr<SmallVector<int64_t>>
 
       // If we couldn't refine the bound, set it to the largest power of 2
       if (!boundRefined && ShapedType::isDynamic(bounds[loopIdx])) {
-        // bounds[loopIdx] = maxPowerOfTwo;
-        bounds[loopIdx] = 1<<20;
+        bounds[loopIdx] = 1 << 20;
         llvm::dbgs() << "Could not refine bound for loop dim " << loopIdx
                      << ", using max power of 2: " << maxPowerOfTwo << "\n";
       }
@@ -1384,7 +1514,6 @@ static FailureOr<SmallVector<int64_t>>
 
     return bounds;
   }
-
 
 
 
