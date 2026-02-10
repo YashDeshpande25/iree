@@ -354,7 +354,7 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
     bool transposedLhs, bool transposedRhs, bool isGemm,
     bool mustBeAligned = true, bool doCPromotion = false, bool scaled = false,
     int64_t splitReductionTripCnt = 0) {
-      llvm::dbgs()<<"getMmaScheduleFromProblemAndTarget called\n";
+      // llvm::dbgs()<<"getMmaScheduleFromProblemAndTarget called\n";
   const int64_t targetSubgroupSize = target.getPreferredSubgroupSize();
   SmallVector<GPUIntrinsicType> intrinsics;
   if (scaled) {
@@ -412,7 +412,7 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   int64_t flops = (2 * mSize * nSize * kSize);
   int64_t bytes = (mSize * nSize + nSize * kSize + mSize * kSize);
 
-  llvm::dbgs()<<"Bytes are "<<bytes<<"\n";
+  // llvm::dbgs()<<"Bytes are "<<bytes<<"\n";
 
   // Only support blocking along the last dimension for now.
   int64_t outerK = (kSize / problem.kSizes.back());
@@ -670,7 +670,7 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     bool isGemm, bool scaled, int64_t splitReductionTripCnt,
     bool cPromoteIfPadding, bool boundsUsingAnalysis, bool hasExistingAccumulator = false,
     std::optional<ConvToIgemmInfo> convToIgemmInfo = std::nullopt) {
-  llvm::dbgs() << "getMatmulOrIGEMMLoweringConfigAndWorkgroupSize called\n";
+  // llvm::dbgs() << "getMatmulOrIGEMMLoweringConfigAndWorkgroupSize called\n";
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -709,15 +709,15 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
   if (ShapedType::isDynamic(bounds[contractionM.back()]) ||
       ShapedType::isDynamic(bounds[contractionN.back()]) ||
       ShapedType::isDynamic(bounds[contractionK.back()])) {
-        llvm::dbgs()<<"There's still dynamic dims in there\n";
+        // llvm::dbgs()<<"There's still dynamic dims in there\n";
     return failure();
   }
-  llvm::dbgs()<<"All dynamic dims have been replaced\n";
-  llvm::dbgs()<<"Inside getMatmulOrIGEMMLoweringConfigAndWorkgroupSize, bounds are [";
-  for(auto dbound: bounds) {
-    llvm::dbgs()<<dbound<<", ";
-  }
-  llvm::dbgs()<<"]\n";
+  // llvm::dbgs()<<"All dynamic dims have been replaced\n";
+  // llvm::dbgs()<<"Inside getMatmulOrIGEMMLoweringConfigAndWorkgroupSize, bounds are [";
+  // for(auto dbound: bounds) {
+  //   llvm::dbgs()<<dbound<<", ";
+  // }
+  // llvm::dbgs()<<"]\n";
 
   // We can support unaligned shapes as long as there are no dynamic dimensions
   // as finding padding bounds for dynamic dimensions is not guaranteed.
@@ -734,7 +734,7 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
       canSupportUnaligned = false;
       continue;
     }
-    llvm::dbgs()<<"M bound is NOT dynamic\n";
+    // llvm::dbgs()<<"M bound is NOT dynamic\n";
     mDims.push_back(mDim);
   }
   for (int64_t nDim : contractionN) {
@@ -803,15 +803,15 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     return llvm::map_to_vector(dims, [&](int64_t dim) {
       if (ShapedType::isDynamic(bounds[dim]) || !canSupportUnaligned ||
           paddingCanBeExpensive) {
-           llvm::dbgs()<<"I am using original value\n"; 
+          //  llvm::dbgs()<<"I am using original value\n"; 
         return bounds[dim];
       }
       if (bounds[dim] > 128) {
-        llvm::dbgs()<<"I am using 128\n";
+        // llvm::dbgs()<<"I am using 128\n";
         return maybePaddedBounds(bounds[dim], 128);
       }
       if (bounds[dim] > 32) {
-        llvm::dbgs()<<"I am using 32\n";
+        // llvm::dbgs()<<"I am using 32\n";
         return maybePaddedBounds(bounds[dim], 32);
       }
 
@@ -1405,8 +1405,8 @@ static FailureOr<SmallVector<int64_t>>
     SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
 
     // Compute the largest power of 2 that fits in int64_t
-    constexpr int64_t bitWidth = sizeof(int64_t) * 8;
-    constexpr int64_t maxPowerOfTwo = int64_t{1} << (bitWidth - 2);
+    // constexpr int64_t bitWidth = sizeof(int64_t) * 8;
+    // constexpr int64_t maxPowerOfTwo = int64_t{1} << (bitWidth - 2);
 
     // Sentinel value used by IntegerRangeAnalysis when bounds are unknown
     constexpr int64_t unboundedSentinel = 9007199254740991;
@@ -1451,7 +1451,7 @@ static FailureOr<SmallVector<int64_t>>
       if (!ShapedType::isDynamic(bound)) {
         continue;
       }
-      llvm::dbgs() << "Bound Index = " << loopIdx << " is dynamic\n";
+      // llvm::dbgs() << "Bound Index = " << loopIdx << " is dynamic\n";
 
       bool boundRefined = false;
 
@@ -1474,7 +1474,7 @@ static FailureOr<SmallVector<int64_t>>
           SmallVector<Value> indexValues;
           DenseSet<Value> visited;
           collectIndexValues(operand, indexValues, visited);
-          llvm::dbgs()<<indexValues.size()<<" number of index values collected\n";
+          // llvm::dbgs()<<indexValues.size()<<" number of index values collected\n";
 
           // Try each index value with getDynamicUpperBound
           for (Value indexValue : indexValues) {
@@ -1482,14 +1482,14 @@ static FailureOr<SmallVector<int64_t>>
             if (succeeded(ub) && *ub > 0) {
               // Filter out the unbounded sentinel
               if (*ub >= unboundedSentinel) {
-                llvm::dbgs() << "  Found unbounded sentinel " << *ub
-                             << ", skipping\n";
+                // llvm::dbgs() << "  Found unbounded sentinel " << *ub
+                //              << ", skipping\n";
                 continue;
               }
 
               bounds[loopIdx] = *ub;
-              llvm::dbgs() << "Refined bound for loop dim " << loopIdx
-                           << " to " << bounds[loopIdx] << "\n";
+              // llvm::dbgs() << "Refined bound for loop dim " << loopIdx
+              //              << " to " << bounds[loopIdx] << "\n";
               boundRefined = true;
               break;
             }
@@ -1507,8 +1507,8 @@ static FailureOr<SmallVector<int64_t>>
       // If we couldn't refine the bound, set it to the largest power of 2
       if (!boundRefined && ShapedType::isDynamic(bounds[loopIdx])) {
         bounds[loopIdx] = 1 << 20;
-        llvm::dbgs() << "Could not refine bound for loop dim " << loopIdx
-                     << ", using max power of 2: " << maxPowerOfTwo << "\n";
+        // llvm::dbgs() << "Could not refine bound for loop dim " << loopIdx
+        //              << ", using max power of 2: " << maxPowerOfTwo << "\n";
       }
     }
 
@@ -1523,7 +1523,7 @@ static FailureOr<SmallVector<int64_t>>
 LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
                                       mlir::FunctionOpInterface entryPoint,
                                       Operation *op, bool useDirectLoad) {
-  llvm::dbgs() << "setMatmulLoweringConfig called \n";
+  // llvm::dbgs() << "setMatmulLoweringConfig called \n";
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   if (!linalgOp ||
       (!linalg::isaContractionOpInterface(linalgOp) &&
@@ -1550,11 +1550,11 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   if (succeeded(maybeBounds)) {
     boundsUsingAnalysis = true;
     bounds = std::move(*maybeBounds);
-    llvm::dbgs() << "Dynamic Bounds Calculated\n";
-    for (auto bound : bounds) {
-      llvm::dbgs() << bound << " ";
-    }
-    llvm::dbgs() << "\n";
+    // llvm::dbgs() << "Dynamic Bounds Calculated\n";
+    // for (auto bound : bounds) {
+    //   llvm::dbgs() << bound << " ";
+    // }
+    // llvm::dbgs() << "\n";
     // LDBG() << "Using refined bounds from range analysis: [";
     // llvm::interleaveComma(bounds, llvm::dbgs());
     // llvm::dbgs() << "]\n";
@@ -1562,8 +1562,8 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
     // Fallback to static loop ranges if analysis fails completely
     bounds = linalgOp.getStaticLoopRanges();
     LDBG() << "Fallback to static loop ranges: [";
-    llvm::interleaveComma(bounds, llvm::dbgs());
-    llvm::dbgs() << "]\n";
+    // llvm::interleaveComma(bounds, llvm::dbgs());
+    // llvm::dbgs() << "]\n";
   }
   ///////////////////////////////////////////////////////////////////////////////
 

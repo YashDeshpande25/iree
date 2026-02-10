@@ -25,7 +25,7 @@ static llvm::cl::opt<bool> clEnableBlockedMatmuls(
     "iree-codegen-block-dynamic-dimensions-of-contractions",
     llvm::cl::desc("developer flag to gaurd blocking dynamic dimensions of "
                    "contraction-like ops"),
-    llvm::cl::Hidden, llvm::cl::init(true));
+    llvm::cl::Hidden, llvm::cl::init(false));
 
 namespace mlir::iree_compiler {
 
