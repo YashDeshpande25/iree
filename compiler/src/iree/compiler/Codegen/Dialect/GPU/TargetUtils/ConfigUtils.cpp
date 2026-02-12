@@ -55,6 +55,14 @@ namespace mlir::iree_compiler::IREE::GPU {
 constexpr int64_t kCacheLineSizeBits = 128 * 8;
 constexpr int64_t kPreferredCopyNumBits = 128;
 
+// Sentinel value used by IntegerRangeAnalysis when bounds are unknown.
+static constexpr uint64_t MAX_DIM_VALUE = (static_cast<uint64_t>(1) << 53) - 1;
+
+// Fallback bound when analysis cannot determine the actual value. Kept small                                                     
+// (2^14) to avoid int64_t overflow when dimensions are multiplied together                                                       
+// in heuristic calculations.
+static constexpr uint64_t MAX_BOUND_VALUE  = static_cast<uint64_t>(1) << 14;
+
 //===----------------------------------------------------------------------===//
 // Lowering Config Selection
 //===----------------------------------------------------------------------===//
@@ -1529,7 +1537,7 @@ static FailureOr<SmallVector<int64_t>>
     SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
 
     // Sentinel value used by IntegerRangeAnalysis when bounds are unknown
-    constexpr int64_t unboundedSentinel = 9007199254740991;
+    // constexpr int64_t unboundedSentinel = MAX_DIM_VALUE;
 
     for (auto [loopIdx, bound] : llvm::enumerate(bounds)) {
       if (!ShapedType::isDynamic(bound)) {
@@ -1556,7 +1564,7 @@ static FailureOr<SmallVector<int64_t>>
           // Use TensorDynamicDimAnalysis to get range info directly
           if (auto range = dynamicDimAnalysis.getRangeInfo(operand, dimIdx)) {
             int64_t ub = range->smax().getSExtValue();
-            if (ub > 0 && ub < unboundedSentinel) {
+            if (ub > 0 && ub < MAX_DIM_VALUE) {
               bounds[loopIdx] = ub;
               // llvm::dbgs() << "Refined bound for loop dim " << loopIdx << " to " << bounds[loopIdx] << "\n";
               boundRefined = true;
@@ -1571,7 +1579,7 @@ static FailureOr<SmallVector<int64_t>>
 
       // If we couldn't refine the bound, set it to a large value
       if (!boundRefined && ShapedType::isDynamic(bounds[loopIdx])) {
-        bounds[loopIdx] = 1 << 20;
+        bounds[loopIdx] = MAX_BOUND_VALUE;
         // llvm::dbgs() << "Could not refine bound for loop dim " << loopIdx << ", using max power of 2: " << bounds[loopIdx] << "\n";
       }
     }
@@ -1607,9 +1615,11 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   FailureOr<SmallVector<int64_t>> maybeBounds =
       getLoopBoundsWithRangeAnalysis(linalgOp, entryPoint);
 
-  SmallVector<int64_t> bounds;
+  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
   if (succeeded(maybeBounds)) {
-    boundsUsingAnalysis = true;
+    if(maybeBounds != bounds) {
+      boundsUsingAnalysis = true;
+    }
     bounds = std::move(*maybeBounds);
     llvm::dbgs() << "Dynamic Bounds Calculated\n";
     for (auto bound : bounds) {
@@ -1622,7 +1632,7 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   } else {
     // Fallback to static loop ranges if analysis fails completely
     bounds = linalgOp.getStaticLoopRanges();
-    LDBG() << "Fallback to static loop ranges: [";
+    // LDBG() << "Fallback to static loop ranges: [";
     // llvm::interleaveComma(bounds, llvm::dbgs());
     // llvm::dbgs() << "]\n";
   }
