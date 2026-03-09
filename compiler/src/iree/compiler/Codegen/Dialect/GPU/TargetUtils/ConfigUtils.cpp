@@ -25,6 +25,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/InterleavedRange.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Attributes.h"
@@ -1412,6 +1413,65 @@ static FailureOr<DistributionInfo> collectOpDistributionInfo(Operation *op) {
   return distInfo;
 };
 
+/// Check if the reduction op has a single combiner operation.
+static bool hasSingleReductionCombiner(linalg::LinalgOp op) {
+  bool foundSingleReductionOutput = false;
+  for (auto [index, initOpOperand] : llvm::enumerate(op.getDpsInitsMutable())) {
+    SmallVector<Operation *> combinerOps;
+    if (matchReduction(op.getRegionOutputArgs(), index, combinerOps) &&
+        combinerOps.size() == 1) {
+      if (foundSingleReductionOutput) {
+        return false;
+      }
+      foundSingleReductionOutput = true;
+      continue;
+    }
+    if (!op.getMatchingIndexingMap(&initOpOperand).isIdentity()) {
+      return false;
+    }
+  }
+  return foundSingleReductionOutput;
+}
+
+/// Determines if we should avoid multi-reduction patterns by forcing
+/// vectorSize=1 on the parallel dimensions. Multi-reduction patterns occur
+/// when each thread handles multiple independent output elements that each
+/// need their own reduction accumulator.
+static bool shouldAvoidMultiReduction(linalg::LinalgOp linalgOp,
+                                      IREE::GPU::TargetAttr target) {
+  SmallVector<utils::IteratorType> iterTypes = linalgOp.getIteratorTypesArray();
+  bool hasReduction = llvm::any_of(iterTypes, linalg::isReductionIterator);
+  if (!hasReduction) {
+    return false;
+  }
+  if (linalg::isaContractionOpInterface(linalgOp)) {
+    return false;
+  }
+
+  if (!hasSingleReductionCombiner(linalgOp)) {
+    return false;
+  }
+
+  // Calculate the total parallel work.
+  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+  int64_t parallelSize = 1;
+  for (auto [idx, iterType] : llvm::enumerate(iterTypes)) {
+    if (ShapedType::isDynamic(bounds[idx])) {
+      // For dynamic bounds, assume there's enough parallel work.
+      parallelSize = std::numeric_limits<int64_t>::max();
+      break;
+    }
+    if (linalg::isParallelIterator(iterType)) {
+      parallelSize *= bounds[idx];
+    }
+  }
+
+  // If parallel size >= preferred workgroup size, we have enough work
+  // for more threads; avoid multi-reduction pattern.
+  int64_t preferredWgSize = target.getPreferredSubgroupSize() * 4;
+  return parallelSize >= preferredWgSize;
+}
+
 LogicalResult setTileAndFuseLoweringConfig(IREE::GPU::TargetAttr target,
                                            mlir::FunctionOpInterface entryPoint,
                                            Operation *op) {
@@ -1569,7 +1629,14 @@ LogicalResult setTileAndFuseLoweringConfig(IREE::GPU::TargetAttr target,
           // idle threads in the subgroup.
           bool hasIdleThreads = distInfo.partitionableLoops.size() == 1 &&
                                 candidate <= subgroupSize;
-          unsigned vectorSize = hasIdleThreads ? 1 : numVectorElements;
+
+          bool avoidMultiReduction = false;
+          if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+            avoidMultiReduction = shouldAvoidMultiReduction(linalgOp, target);
+          }
+          unsigned vectorSize =
+              (hasIdleThreads || avoidMultiReduction) ? 1 : numVectorElements;
+          // unsigned vectorSize = hasIdleThreads ? 1 : numVectorElements;
           LDBG() << "Use vector size: " << vectorSize;
           threadTileSizes[shapeDim] = vectorSize * scaleToByte;
           candidateWorkgroupSize = candidate / vectorSize;
@@ -1615,7 +1682,9 @@ LogicalResult setTileAndFuseLoweringConfig(IREE::GPU::TargetAttr target,
   };
 
   // First try to see if we can use up all threads without any loss.
-  int64_t newNumThreads = subgroupSize;
+  // Try with at least four subgroups first per workgroup for better occupancy &
+  // hardware utilization.
+  int64_t newNumThreads = subgroupSize * 4;
   if (distributeToThreads(newNumThreads) != 1) {
     // Otherwise, allow larger and larger loss factor.
 
