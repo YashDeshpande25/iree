@@ -2338,6 +2338,32 @@ static LogicalResult setConvolutionConfig(
 // Pipeline Configuration
 //====---------------------------------------------------------------------===//
 
+static bool isOuterReduction(linalg::LinalgOp op) {
+  if (!op.getNumReductionLoops()) {
+    return false;
+  }
+  SmallVector<unsigned> reductionDims;
+  op.getReductionDims(reductionDims);
+  for (OpOperand *input : op.getDpsInputOperands()) {
+    AffineMap map = op.getMatchingIndexingMap(input);
+    if (map.getNumResults() == 0) {
+      continue;
+    }
+    if (!map.isPermutation()) {
+      continue;
+    }
+    auto firstResult = dyn_cast<AffineDimExpr>(map.getResult(0));
+    if (!firstResult) {
+      continue;
+    }
+    unsigned dimPos = firstResult.getPosition();
+    if (llvm::is_contained(reductionDims, dimPos)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
                                    mlir::FunctionOpInterface entryPointFn,
                                    Operation *computeOp) {
@@ -2391,6 +2417,13 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
     if (succeeded(setContractConfig(target, entryPointFn, linalgOp))) {
       LDBG() << "Contract Config";
       return success();
+    }
+    if (isOuterReduction(linalgOp)) {
+      if (succeeded(IREE::GPU::setTileAndFuseLoweringConfig(
+              target, entryPointFn, linalgOp))) {
+        LDBG() << "Outer reduction Tile and Fuse Config";
+        return success();
+      }
     }
     if (clGPUEnableReductionVectorDistribution) {
       LDBG() << "ReductionVectorDistribution: finding a suitable config...";
