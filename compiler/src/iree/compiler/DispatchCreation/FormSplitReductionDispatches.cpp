@@ -41,6 +41,147 @@ private:
 };
 } // namespace
 
+namespace {
+
+  /// Fuses two sibling `linalg.reduce` ops that share reduction dimensions
+  /// and iteration space into a single multi-output `linalg.reduce`.
+  ///
+  /// This enables the case where split-reduction turned a multi-output
+  /// linalg.generic into N separate linalg.reduce ops (one per output).
+  /// FormDispatchRegions treats each as its own root => N dispatches.
+  /// After this fusion, there is one root => one dispatch.
+  struct FuseSiblingLinalgReducePattern
+      : public OpRewritePattern<linalg::ReduceOp> {
+    using OpRewritePattern<linalg::ReduceOp>::OpRewritePattern;
+  
+    LogicalResult matchAndRewrite(linalg::ReduceOp firstOp,
+                                  PatternRewriter &rewriter) const override {
+      // Skip if already inside a dispatch region.
+      if (firstOp->getParentOfType<IREE::Flow::DispatchRegionOp>() ||
+          firstOp->getParentOfType<IREE::Flow::DispatchWorkgroupsOp>()) {
+        return failure();
+      }
+  
+      // Find a sibling linalg.reduce in the same block that can be fused.
+      Block *parentBlock = firstOp->getBlock();
+      linalg::ReduceOp secondOp = nullptr;
+      for (Operation &op : *parentBlock) {
+        auto candidate = dyn_cast<linalg::ReduceOp>(&op);
+        if (!candidate || candidate == firstOp) continue;
+        if (!areFusable(firstOp, candidate)) continue;
+        if (hasDependencyBetween(firstOp, candidate)) continue;
+        secondOp = candidate;
+        break;
+      }
+      if (!secondOp) return failure();
+  
+      // Build the fused multi-output linalg.reduce.
+      SmallVector<Value> fusedInputs(firstOp.getInputs());
+      fusedInputs.append(secondOp.getInputs().begin(),
+                         secondOp.getInputs().end());
+      SmallVector<Value> fusedInits(firstOp.getInits());
+      fusedInits.append(secondOp.getInits().begin(),
+                        secondOp.getInits().end());
+  
+      // Pick the op that dominates to be the insertion point.
+      Operation *insertionOp =
+          firstOp->isBeforeInBlock(secondOp) ? secondOp.getOperation()
+                                             : firstOp.getOperation();
+      rewriter.setInsertionPoint(insertionOp);
+  
+      auto fusedOp = linalg::ReduceOp::create(
+          rewriter, firstOp.getLoc(), fusedInputs, fusedInits,
+          firstOp.getDimensions(),
+          [&](OpBuilder &b, Location loc, ValueRange args) {
+            // args layout: [in0_a, in0_b, ..., init0_a, init0_b, ...]
+            unsigned n1 = firstOp.getInputs().size();
+            unsigned n2 = secondOp.getInputs().size();
+            unsigned numIns = n1 + n2;
+  
+            // Clone first op's combiner, remapping its block args.
+            IRMapping map1;
+            for (unsigned i = 0; i < n1; ++i) {
+              map1.map(firstOp.getCombiner().getArgument(i), args[i]);
+              map1.map(firstOp.getCombiner().getArgument(n1 + i),
+                       args[numIns + i]);
+            }
+            SmallVector<Value> yields1;
+            for (Operation &op :
+                 firstOp.getCombiner().front().without_terminator()) {
+              b.clone(op, map1);
+            }
+            auto yield1 = cast<linalg::YieldOp>(
+                firstOp.getCombiner().front().getTerminator());
+            for (Value v : yield1.getValues())
+              yields1.push_back(map1.lookup(v));
+  
+            // Clone second op's combiner, remapping its block args.
+            IRMapping map2;
+            for (unsigned i = 0; i < n2; ++i) {
+              map2.map(secondOp.getCombiner().getArgument(i), args[n1 + i]);
+              map2.map(secondOp.getCombiner().getArgument(n2 + i),
+                       args[numIns + n1 + i]);
+            }
+            SmallVector<Value> yields2;
+            for (Operation &op :
+                 secondOp.getCombiner().front().without_terminator()) {
+              b.clone(op, map2);
+            }
+            auto yield2 = cast<linalg::YieldOp>(
+                secondOp.getCombiner().front().getTerminator());
+            for (Value v : yield2.getValues())
+              yields2.push_back(map2.lookup(v));
+  
+            SmallVector<Value> allYields(yields1);
+            allYields.append(yields2.begin(), yields2.end());
+            linalg::YieldOp::create(b, loc, allYields);
+          });
+  
+      // Replace uses: first op's results are fusedOp.getResults()[0..n1),
+      // second op's results are fusedOp.getResults()[n1..n1+n2).
+      unsigned n1 = firstOp.getResults().size();
+      rewriter.replaceOp(firstOp, fusedOp.getResults().take_front(n1));
+      rewriter.replaceOp(secondOp, fusedOp.getResults().drop_front(n1));
+      return success();
+    }
+  
+  private:
+    static bool areFusable(linalg::ReduceOp a, linalg::ReduceOp b) {
+      if (a.getDimensions() != b.getDimensions()) return false;
+  
+      // All inputs in the fused op must share a shape (SameVariadicOperandSize
+      // + shape check in verifier).
+      auto aInType = cast<ShapedType>(a.getInputs()[0].getType());
+      auto bInType = cast<ShapedType>(b.getInputs()[0].getType());
+      if (aInType.getShape() != bInType.getShape()) return false;
+  
+      // Same for inits.
+      auto aInitType = cast<ShapedType>(a.getInits()[0].getType());
+      auto bInitType = cast<ShapedType>(b.getInits()[0].getType());
+      if (aInitType.getShape() != bInitType.getShape()) return false;
+  
+      return true;
+    }
+  
+    static bool hasDependencyBetween(linalg::ReduceOp a, linalg::ReduceOp b) {
+      // Reject if b uses any result of a, or vice versa. A proper impl should
+      // also check transitive deps via backward slice; this is the simple check.
+      for (Value result : a->getResults()) {
+        for (Operation *user : result.getUsers()) {
+          if (user == b.getOperation()) return true;
+        }
+      }
+      for (Value result : b->getResults()) {
+        for (Operation *user : result.getUsers()) {
+          if (user == a.getOperation()) return true;
+        }
+      }
+      return false;
+    }
+  };
+  
+  } // namespace
+
 static SmallVector<unsigned> getReductionDims(TilingInterface op) {
   SmallVector<unsigned> dims;
   for (auto [i, loopType] : llvm::enumerate(op.getLoopIteratorTypes())) {
@@ -209,6 +350,7 @@ void FormSplitReductionDispatchesPass::runOnOperation() {
   RewritePatternSet patterns(context);
   linalg::populateSwapExtractSliceWithFillPatterns(patterns);
   tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
+  patterns.insert<FuseSiblingLinalgReducePattern>(context);  // <-- NEW
   GreedyRewriteConfig config;
   config.setMaxIterations(GreedyRewriteConfig::kNoLimit).enableFolding(true);
   if (failed(applyPatternsGreedily(funcOp, std::move(patterns), config))) {
