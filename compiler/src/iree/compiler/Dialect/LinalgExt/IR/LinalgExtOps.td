@@ -959,6 +959,113 @@ def IREELinalgExt_ArgCompareOp : IREELinalgExt_Op<"arg_compare", [
 }
 
 //===----------------------------------------------------------------------===//
+// WelfordVariance
+//===----------------------------------------------------------------------===//
+
+def IREELinalgExt_WelfordVarianceOp : IREELinalgExt_Op<"welford_variance", [
+    DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface,
+        ["reifyResultShapes"]>,
+    DeclareOpInterfaceMethods<TilingInterface,
+        ["generateScalarImplementation",
+         "getIterationDomain",
+         "getLoopIteratorTypes",
+         "getResultTilePosition",
+         "getTiledImplementation"]>,
+    DeclareOpInterfaceMethods<PartialReductionOpInterface,
+        ["generateInitialTensorForPartialReduction",
+         "tileToPartialReduction",
+         "mergeReductions",
+         "getPartialResultTilePosition"]>]> {
+  let summary = [{
+    Computes mean, M2 (sum of squared deviations), and element count using
+    Welford's numerically stable online algorithm.
+  }];
+  let description = [{
+    Reduces `input` along the dimensions listed in `dimensions` using
+    Welford's online algorithm, producing three results per parallel position:
+      - `mean`  : running mean
+      - `m2`    : running sum of squared deviations from the mean
+      - `count` : number of elements that contributed
+
+    Sample variance can be recovered as `m2 / (count - 1)`; population
+    variance as `m2 / count`.
+
+    Welford's algorithm has two properties that make it a good fit here:
+
+    1. Numerical stability -- it never forms `sum(x^2)` directly, avoiding
+       catastrophic cancellation that the naive two-pass formula suffers from.
+
+    2. Parallelizability -- two partial results `(n_a, mu_a, M2_a)` and
+       `(n_b, mu_b, M2_b)` can be combined (Chan, Golub, LeVeque 1979) as:
+
+       ```
+       n  = n_a + n_b
+       d  = mu_b - mu_a
+       mu = mu_a + d * (n_b / n)
+       M2 = M2_a + M2_b + d * d * (n_a * n_b) / n
+       ```
+
+       This is what lets the op implement `PartialReductionOpInterface`
+       and participate in split-K / split-reduction pipelines.
+
+    The three output (`outs`) operands are destination-passing-style inits
+    whose shapes describe the parallel (non-reduced) portion of `input`.
+
+    Example:
+    ```mlir
+    %mean_init  = tensor.empty() : tensor<4xf32>
+    %m2_init    = tensor.empty() : tensor<4xf32>
+    %count_init = tensor.empty() : tensor<4xi64>
+    %mean, %m2, %count = iree_linalg_ext.welford_variance
+        dimensions = [1]
+        ins(%input : tensor<4x1024xf32>)
+        outs(%mean_init, %m2_init, %count_init
+             : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+        -> tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+    ```
+  }];
+
+  let arguments = (ins
+      AnyShaped:$input,
+      AnyShaped:$mean_init,
+      AnyShaped:$m2_init,
+      AnyShaped:$count_init,
+      DenseI64ArrayAttr:$dimensions
+  );
+
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+
+  let assemblyFormat = [{
+    attr-dict
+    `dimensions` `=` $dimensions
+    `ins` `(` $input `:` type($input) `)`
+    `outs` `(` $mean_init `,` $m2_init `,` $count_init
+            `:` type($mean_init) `,` type($m2_init) `,` type($count_init) `)`
+    (`->` type($results)^)?
+  }];
+
+  let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
+    // DestinationStyleOpInterface: the three init operands (positions 1..3)
+    // are the DPS inits. Implemented in LinalgExtOps.cpp.
+    MutableOperandRange getDpsInitsMutable();
+
+    // Convenience accessors.
+    ShapedType getInputType()  { return cast<ShapedType>(getInput().getType()); }
+    ShapedType getMeanType()   { return cast<ShapedType>(getMeanInit().getType()); }
+    ShapedType getM2Type()     { return cast<ShapedType>(getM2Init().getType()); }
+    ShapedType getCountType()  { return cast<ShapedType>(getCountInit().getType()); }
+
+    int64_t getInputRank()          { return getInputType().getRank(); }
+    ArrayRef<int64_t> getInputShape() { return getInputType().getShape(); }
+
+    int64_t getNumReductionDims() { return getDimensions().size(); }
+    int64_t getNumParallelDims()  {
+      return getInputRank() - getNumReductionDims();
+    }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // Attention
 //===----------------------------------------------------------------------===//
 
