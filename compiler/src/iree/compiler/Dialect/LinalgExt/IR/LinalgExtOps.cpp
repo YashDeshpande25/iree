@@ -1636,6 +1636,105 @@ MutableOperandRange ArgCompareOp::getDpsInitsMutable() {
                              /*numInits=*/2);
 }
 
+
+//===----------------------------------------------------------------------===//
+// WelfordVarianceOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult WelfordVarianceOp::verify() {
+  Operation *op = getOperation();
+
+  // --- (1) dimensions attribute sanity ---------------------------------
+  ArrayRef<int64_t> dims = getDimensions();
+  int64_t inputRank = getInputRank();
+
+  if (dims.empty()) {
+    return op->emitOpError("expected at least one reduction dimension");
+  }
+  llvm::SmallDenseSet<int64_t> seen;
+  for (int64_t d : dims) {
+    if (d < 0 || d >= inputRank) {
+      return op->emitOpError("reduction dimension ")
+             << d << " is out of range [0, " << inputRank << ")";
+    }
+    if (!seen.insert(d).second) {
+      return op->emitOpError("reduction dimension ")
+             << d << " appears more than once";
+    }
+  }
+
+  // --- (2) element types -------------------------------------------------
+  Type inputElem  = getInputType().getElementType();
+  Type meanElem   = getMeanType().getElementType();
+  Type m2Elem     = getM2Type().getElementType();
+  Type countElem  = getCountType().getElementType();
+
+  if (!isa<FloatType>(inputElem)) {
+    return op->emitOpError("input element type must be floating-point, got ")
+           << inputElem;
+  }
+  if (meanElem != inputElem) {
+    return op->emitOpError("mean_init element type (")
+           << meanElem << ") must match input element type (" << inputElem << ")";
+  }
+  if (m2Elem != inputElem) {
+    return op->emitOpError("m2_init element type (")
+           << m2Elem << ") must match input element type";
+  }
+  if (!isa<IntegerType, IndexType>(countElem)) {
+    return op->emitOpError("count_init element type must be integer or index, got ")
+           << countElem;
+  }
+
+  // --- (3) init shapes must match each other ----------------------------
+  ArrayRef<int64_t> meanShape  = getMeanType().getShape();
+  if (getM2Type().getShape()    != meanShape ||
+      getCountType().getShape() != meanShape) {
+    return op->emitOpError(
+        "mean_init, m2_init, and count_init must have the same shape");
+  }
+
+  // --- (4) init shape must equal input shape with dimensions removed -----
+  ArrayRef<int64_t> inputShape = getInputShape();
+  SmallVector<int64_t> expected;
+  llvm::SmallDenseSet<int64_t> reduced(dims.begin(), dims.end());
+  for (int64_t i = 0; i < inputRank; ++i) {
+    if (!reduced.contains(i))
+      expected.push_back(inputShape[i]);
+  }
+  if (meanShape != ArrayRef<int64_t>(expected)) {
+    return op->emitOpError("expected init shape ")
+           << expected << ", but got " << meanShape;
+  }
+
+  // --- (5) result count and types tie to inits --------------------------
+  if (getNumResults() != 0) {
+    if (getNumResults() != 3) {
+      return op->emitOpError("expected 0 or 3 results, got ")
+             << getNumResults();
+    }
+    if (getResults()[0].getType() != getMeanInit().getType() ||
+        getResults()[1].getType() != getM2Init().getType()  ||
+        getResults()[2].getType() != getCountInit().getType()) {
+      return op->emitOpError("result types must match destination types");
+    }
+  }
+
+  return success();
+}
+
+LogicalResult WelfordVarianceOp::reifyResultShapes(
+  OpBuilder &b, ReifiedRankedShapedTypeDims &reifiedReturnShapes) {
+return cast<LinalgExtOp>(getOperation())
+    .reifyResultShapes(b, reifiedReturnShapes);
+}
+
+MutableOperandRange WelfordVarianceOp::getDpsInitsMutable() {
+  // Operand layout: [input, mean_init, m2_init, count_init]
+  // Inits occupy positions 1..3 inclusive, length 3.
+  return MutableOperandRange(getOperation(), /*start=*/1, /*length=*/3);
+}
+
 //===----------------------------------------------------------------------===//
 // Helpers
 //===----------------------------------------------------------------------===//
@@ -3338,6 +3437,7 @@ DEFINE_OP_GET_EFFECTS(ScanOp)
 DEFINE_OP_GET_EFFECTS(TopkOp)
 DEFINE_OP_GET_EFFECTS(TopkV2Op)
 DEFINE_OP_GET_EFFECTS(ArgCompareOp)
+DEFINE_OP_GET_EFFECTS(WelfordVarianceOp)
 DEFINE_OP_GET_EFFECTS(WinogradInputTransformOp)
 DEFINE_OP_GET_EFFECTS(WinogradFilterTransformOp)
 DEFINE_OP_GET_EFFECTS(WinogradOutputTransformOp)

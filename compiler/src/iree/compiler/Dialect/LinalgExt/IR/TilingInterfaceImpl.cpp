@@ -2308,6 +2308,434 @@ LogicalResult ArgCompareOp::getPartialResultTilePosition(
 }
 
 //===----------------------------------------------------------------------===//
+// WelfordVarianceOp
+//===----------------------------------------------------------------------===//
+
+namespace {
+  /// Returns the dimensions of the Welford op's iteration space that are
+  /// parallel (i.e. NOT listed in `dimensions`). Returned in ascending order.
+  /// These are also the dims that index into the per-output-position
+  /// accumulators (mean_init, m2_init, count_init).
+  static SmallVector<int64_t>
+  getWelfordParallelDims(WelfordVarianceOp op) {
+    llvm::SmallDenseSet<int64_t> reductionSet;
+    for (int64_t d : op.getDimensions())
+      reductionSet.insert(d);
+    SmallVector<int64_t> parallel;
+    for (int64_t d = 0, e = op.getInputRank(); d < e; ++d) {
+      if (!reductionSet.contains(d))
+        parallel.push_back(d);
+    }
+    return parallel;
+  }
+} // namespace
+
+SmallVector<utils::IteratorType>
+WelfordVarianceOp::getLoopIteratorTypes() {
+  // One iterator per input dim. Default to parallel, flip reduction dims.
+  SmallVector<utils::IteratorType> iterators(getInputRank(),
+                                             utils::IteratorType::parallel);
+  for (int64_t d : getDimensions())
+    iterators[d] = utils::IteratorType::reduction;
+  return iterators;
+}
+
+SmallVector<Range>
+WelfordVarianceOp::getIterationDomain(OpBuilder &builder) {
+  int64_t rank = getInputRank();
+  SmallVector<Range> loopBounds(rank);
+  Location loc = getLoc();
+  OpFoldResult zero = builder.getIndexAttr(0);
+  OpFoldResult one  = builder.getIndexAttr(1);
+  Value source = getInput();
+  for (int64_t d = 0; d < rank; ++d) {
+    loopBounds[d].offset = zero;
+    loopBounds[d].size   = getDim(builder, loc, source, d);
+    loopBounds[d].stride = one;
+  }
+  return loopBounds;
+}
+
+FailureOr<TilingResult> WelfordVarianceOp::getTiledImplementation(
+  OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+  ArrayRef<OpFoldResult> sizes) {
+  int64_t rank = getInputRank();
+  assert(offsets.size() == static_cast<size_t>(rank) &&
+        sizes.size()   == static_cast<size_t>(rank));
+
+  Location loc = getLoc();
+  OpFoldResult oneAttr = builder.getIndexAttr(1);
+
+  // 1. Slice the INPUT along every iteration-space dim.
+  SmallVector<OpFoldResult> inputStrides(rank, oneAttr);
+  Operation *inputSlice =
+      getSlice(builder, loc, getInput(), offsets, sizes, inputStrides);
+
+  // 2. Slice each of the three INITs along only the parallel dims.
+  SmallVector<int64_t> parallelDims = getWelfordParallelDims(*this);
+  SmallVector<OpFoldResult> initOffsets, initSizes;
+  initOffsets.reserve(parallelDims.size());
+  initSizes.reserve(parallelDims.size());
+  for (int64_t d : parallelDims) {
+    initOffsets.push_back(offsets[d]);
+    initSizes.push_back(sizes[d]);
+  }
+  SmallVector<OpFoldResult> initStrides(parallelDims.size(), oneAttr);
+
+  Operation *meanSlice =
+      getSlice(builder, loc, getMeanInit(),  initOffsets, initSizes, initStrides);
+  Operation *m2Slice =
+      getSlice(builder, loc, getM2Init(),    initOffsets, initSizes, initStrides);
+  Operation *cntSlice =
+      getSlice(builder, loc, getCountInit(), initOffsets, initSizes, initStrides);
+
+  // 3. Assemble the operand list for the tiled clone and clone the op.
+  SmallVector<Value> tiledOperands{
+      inputSlice->getResult(0),
+      meanSlice->getResult(0),
+      m2Slice->getResult(0),
+      cntSlice->getResult(0)};
+
+  SmallVector<Type> resultTypes;
+  if (getNumResults()) {
+    resultTypes = {meanSlice->getResult(0).getType(),
+                  m2Slice->getResult(0).getType(),
+                  cntSlice->getResult(0).getType()};
+  }
+  Operation *tiled =
+      mlir::clone(builder, getOperation(), resultTypes, tiledOperands);
+
+  return TilingResult{
+      /*tiledOps=*/{tiled},
+      /*tiledValues=*/SmallVector<Value>(tiled->getResults()),
+      /*generatedSlices=*/{inputSlice, meanSlice, m2Slice, cntSlice}};
+}
+
+
+LogicalResult WelfordVarianceOp::getResultTilePosition(
+  OpBuilder &builder, unsigned resultNumber,
+  ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
+  SmallVector<OpFoldResult> &resultOffsets,
+  SmallVector<OpFoldResult> &resultSizes) {
+  // All three results share the same shape: the parallel portion of the
+  // iteration space. Project iteration-space offsets/sizes down to just the
+  // parallel dims.
+  for (int64_t d : getWelfordParallelDims(*this)) {
+    resultOffsets.push_back(offsets[d]);
+    resultSizes.push_back(sizes[d]);
+  }
+  return success();
+}
+
+LogicalResult
+WelfordVarianceOp::generateScalarImplementation(OpBuilder &b, Location loc,
+                                                ValueRange ivs) {
+  // Only implemented for buffer (memref) semantics. The scalar-implementation
+  // path is an "exit lowering" that runs after bufferization.
+  if (!hasPureBufferSemantics())
+    return failure();
+
+  // Split `ivs` into the parallel portion. Reduction dims of `ivs` are used
+  // to load `input`, but the accumulator (mean/m2/count) buffers are indexed
+  // only by the parallel dims.
+  SmallVector<int64_t> parallelDims = getWelfordParallelDims(*this);
+  SmallVector<Value> parIvs;
+  parIvs.reserve(parallelDims.size());
+  for (int64_t d : parallelDims)
+    parIvs.push_back(ivs[d]);
+
+  // Load current accumulators (one per output position).
+  Value oldMean  = memref::LoadOp::create(b, loc, getMeanInit(),  parIvs);
+  Value oldM2    = memref::LoadOp::create(b, loc, getM2Init(),    parIvs);
+  Value oldCount = memref::LoadOp::create(b, loc, getCountInit(), parIvs);
+
+  // Load this input element.
+  Value x = memref::LoadOp::create(b, loc, getInput(), ivs);
+
+  // Element types.
+  Type fpTy  = cast<ShapedType>(getMeanInit().getType()).getElementType();
+  Type cntTy = cast<ShapedType>(getCountInit().getType()).getElementType();
+
+  // --- Welford update ---
+  //   new_count = old_count + 1
+  //   delta     = x - old_mean
+  //   new_mean  = old_mean + delta / new_count
+  //   delta2    = x - new_mean
+  //   new_m2    = old_m2 + delta * delta2
+  Value oneCnt = arith::ConstantOp::create(
+      b, loc, b.getIntegerAttr(cntTy, 1));
+  Value newCount = arith::AddIOp::create(b, loc, oldCount, oneCnt);
+  Value countF   = arith::SIToFPOp::create(b, loc, fpTy, newCount);
+  Value delta    = arith::SubFOp::create(b, loc, x, oldMean);
+  Value quot     = arith::DivFOp::create(b, loc, delta, countF);
+  Value newMean  = arith::AddFOp::create(b, loc, oldMean, quot);
+  Value delta2   = arith::SubFOp::create(b, loc, x, newMean);
+  Value prod     = arith::MulFOp::create(b, loc, delta, delta2);
+  Value newM2    = arith::AddFOp::create(b, loc, oldM2, prod);
+
+  // Store updated accumulators back.
+  memref::StoreOp::create(b, loc, newMean,  getMeanInit(),  parIvs);
+  memref::StoreOp::create(b, loc, newM2,    getM2Init(),    parIvs);
+  memref::StoreOp::create(b, loc, newCount, getCountInit(), parIvs);
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// WelfordVarianceOp - PartialReductionOpInterface
+//===----------------------------------------------------------------------===//
+
+FailureOr<SmallVector<Value>>
+WelfordVarianceOp::generateInitialTensorForPartialReduction(
+    OpBuilder &b, Location loc, ArrayRef<OpFoldResult> sizes,
+    const llvm::SetVector<unsigned> &reductionDims) {
+  // The partial accumulator tensors carry one "slot" per parallel tile in the
+  // iteration space. Their shape equals the iteration-space tile shape.
+  SmallVector<OpFoldResult> shape(sizes);
+
+  Type meanElTy  = cast<ShapedType>(getMeanInit().getType()).getElementType();
+  Type m2ElTy    = cast<ShapedType>(getM2Init().getType()).getElementType();
+  Type countElTy = cast<ShapedType>(getCountInit().getType()).getElementType();
+
+  Value emptyMean  = tensor::EmptyOp::create(b, loc, shape, meanElTy);
+  Value emptyM2    = tensor::EmptyOp::create(b, loc, shape, m2ElTy);
+  Value emptyCount = tensor::EmptyOp::create(b, loc, shape, countElTy);
+
+  // Identity state of Welford: mean=0, M2=0, count=0.
+  Value zeroMean  = arith::ConstantOp::create(
+      b, loc, b.getFloatAttr(meanElTy, 0.0));
+  Value zeroM2    = arith::ConstantOp::create(
+      b, loc, b.getFloatAttr(m2ElTy, 0.0));
+  Value zeroCount = arith::ConstantOp::create(
+      b, loc, b.getIntegerAttr(countElTy, 0));
+
+  Value meanFill  = linalg::FillOp::create(
+      b, loc, ValueRange{zeroMean},  emptyMean).getResult(0);
+  Value m2Fill    = linalg::FillOp::create(
+      b, loc, ValueRange{zeroM2},    emptyM2).getResult(0);
+  Value countFill = linalg::FillOp::create(
+      b, loc, ValueRange{zeroCount}, emptyCount).getResult(0);
+
+  return SmallVector<Value>{meanFill, m2Fill, countFill};
+}
+
+FailureOr<TilingResult> WelfordVarianceOp::tileToPartialReduction(
+    OpBuilder &b, Location loc, ReductionTilingStrategy strategy,
+    ValueRange init, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    const llvm::SetVector<unsigned> &reductionDims,
+    ArrayRef<OpFoldResult> splitReductionIvs) {
+  // We only support the scf.forall-style split ("OuterParallel") and
+  // exactly one reduction dim being split. These cover the common split-K
+  // case. Anything else: bail out, the tiling driver will fall back.
+  if (strategy != ReductionTilingStrategy::PartialReductionOuterParallel) {
+    return failure();
+  }
+  if (reductionDims.size() != 1) {
+    return failure();
+  }
+  int64_t rDim = reductionDims.front();
+  int64_t rank = getInputRank();
+
+  // 1) Slice the INPUT along every iteration-space dim.
+  SmallVector<OpFoldResult> strides(rank, b.getIndexAttr(1));
+  Operation *inputSlice =
+      getSlice(b, loc, getInput(), offsets, sizes, strides);
+
+  // 2) Slice each of the three PARTIAL accumulators so the tiled op sees
+  //    operands WITHOUT the split dim (rank-reducing slice):
+  //      - reduction dim: offset = my iv, size = 1 (only my slot)
+  //      - parallel dim : offset = offsets[d], size = sizes[d]
+  SmallVector<OpFoldResult> accOffsets, accSizes, accStrides;
+  accOffsets.reserve(rank);
+  accSizes.reserve(rank);
+  accStrides.reserve(rank);
+  for (int64_t d = 0; d < rank; ++d) {
+    if (d == rDim) {
+      accOffsets.push_back(splitReductionIvs.front());
+      accSizes.push_back(b.getIndexAttr(1));
+    } else {
+      accOffsets.push_back(offsets[d]);
+      accSizes.push_back(sizes[d]);
+    }
+    accStrides.push_back(b.getIndexAttr(1));
+  }
+
+  // Build the rank-reduced slice result shape (drops the size-1 split dim).
+  SmallVector<int64_t> redShape;
+  redShape.reserve(rank - 1);
+  for (int64_t d = 0; d < rank; ++d) {
+    if (d == rDim) continue;
+    redShape.push_back(
+        getConstantIntValue(accSizes[d]).value_or(ShapedType::kDynamic));
+  }
+
+  auto meanElTy  = cast<ShapedType>(init[0].getType()).getElementType();
+  auto m2ElTy    = cast<ShapedType>(init[1].getType()).getElementType();
+  auto countElTy = cast<ShapedType>(init[2].getType()).getElementType();
+
+  auto meanSliceTy  = RankedTensorType::get(redShape, meanElTy);
+  auto m2SliceTy    = RankedTensorType::get(redShape, m2ElTy);
+  auto countSliceTy = RankedTensorType::get(redShape, countElTy);
+
+  auto meanSliceOp  = tensor::ExtractSliceOp::create(
+      b, loc, meanSliceTy,  init[0], accOffsets, accSizes, accStrides);
+  auto m2SliceOp    = tensor::ExtractSliceOp::create(
+      b, loc, m2SliceTy,    init[1], accOffsets, accSizes, accStrides);
+  auto countSliceOp = tensor::ExtractSliceOp::create(
+      b, loc, countSliceTy, init[2], accOffsets, accSizes, accStrides);
+
+  // 3) Clone the op for this partition's slice.
+  SmallVector<Value> tiledOperands{
+      inputSlice->getResult(0),
+      meanSliceOp.getResult(),
+      m2SliceOp.getResult(),
+      countSliceOp.getResult()};
+
+  SmallVector<Type> resultTypes;
+  if (hasPureTensorSemantics()) {
+    resultTypes = {meanSliceTy, m2SliceTy, countSliceTy};
+  }
+
+  Operation *tiled =
+      mlir::clone(b, getOperation(), resultTypes, tiledOperands);
+
+  SmallVector<Operation *> slices{
+      inputSlice, meanSliceOp, m2SliceOp, countSliceOp};
+  return TilingResult{
+      /*tiledOps=*/{tiled},
+      /*tiledValues=*/SmallVector<Value>(tiled->getResults()),
+      /*generatedSlices=*/slices};
+}
+
+LogicalResult WelfordVarianceOp::getPartialResultTilePosition(
+    OpBuilder &b, unsigned resultNumber,
+    ReductionTilingStrategy tilingStrategy,
+    ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
+    const llvm::SetVector<unsigned> &reductionDims,
+    ArrayRef<OpFoldResult> splitReductionIvs,
+    SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  if (tilingStrategy !=
+      ReductionTilingStrategy::PartialReductionOuterParallel) {
+    return failure();
+  }
+  if (reductionDims.size() != 1) {
+    return failure();
+  }
+  int64_t rDim = reductionDims.front();
+  int64_t rank = getInputRank();
+
+  resultOffsets.clear();
+  resultSizes.clear();
+  resultOffsets.reserve(rank);
+  resultSizes.reserve(rank);
+
+  for (int64_t d = 0; d < rank; ++d) {
+    if (d == rDim) {
+      // Write exactly one slot per forall iteration, at position iv.
+      resultOffsets.push_back(splitReductionIvs.front());
+      resultSizes.push_back(b.getIndexAttr(1));
+    } else {
+      resultOffsets.push_back(offsets[d]);
+      resultSizes.push_back(sizes[d]);
+    }
+  }
+  return success();
+}
+
+FailureOr<MergeResult> WelfordVarianceOp::mergeReductions(
+    OpBuilder &b, Location loc, ValueRange partialReduce,
+    const llvm::SetVector<unsigned> &reductionDims) {
+  if (reductionDims.size() != 1) {
+    return failure();
+  }
+  int64_t splitDim = reductionDims.front();
+  int64_t rank = cast<ShapedType>(partialReduce[0].getType()).getRank();
+
+  // Indexing maps for linalg.generic:
+  //   * inputs  : identity over all `rank` dims       (read every partition)
+  //   * outputs : identity with the split dim dropped (reduce along split)
+  MLIRContext *ctx = b.getContext();
+  SmallVector<AffineExpr> inExprs, outExprs;
+  inExprs.reserve(rank);
+  outExprs.reserve(rank - 1);
+  for (int64_t d = 0; d < rank; ++d) {
+    inExprs.push_back(getAffineDimExpr(d, ctx));
+    if (d != splitDim) {
+      outExprs.push_back(getAffineDimExpr(d, ctx));
+    }
+  }
+  AffineMap inMap  = AffineMap::get(rank, /*symbols=*/0, inExprs,  ctx);
+  AffineMap outMap = AffineMap::get(rank, /*symbols=*/0, outExprs, ctx);
+
+  SmallVector<AffineMap> indexingMaps{
+      inMap, inMap, inMap,      // 3 inputs:  pmean, pM2, pcount
+      outMap, outMap, outMap};  // 3 outputs: mean,  M2,  count
+
+  SmallVector<utils::IteratorType> iterators(
+      rank, utils::IteratorType::parallel);
+  iterators[splitDim] = utils::IteratorType::reduction;
+
+  Type fpTy  = cast<ShapedType>(partialReduce[0].getType()).getElementType();
+
+  Value meanDst  = getMeanInit();
+  Value m2Dst    = getM2Init();
+  Value countDst = getCountInit();
+
+  auto genericOp = linalg::GenericOp::create(
+      b, loc,
+      /*resultTensorTypes=*/
+      TypeRange{meanDst.getType(), m2Dst.getType(), countDst.getType()},
+      /*inputs=*/
+      ValueRange{partialReduce[0], partialReduce[1], partialReduce[2]},
+      /*outputs=*/ValueRange{meanDst, m2Dst, countDst},
+      /*indexingMaps=*/indexingMaps,
+      /*iteratorTypes=*/iterators,
+      /*bodyBuilder=*/
+      [&](OpBuilder &bb, Location lLoc, ValueRange args) {
+        // args order: [pmean, pM2, pcount, aMean, aM2, aCount]
+        Value pm  = args[0];
+        Value ps  = args[1];
+        Value pn  = args[2];
+        Value aMu = args[3];
+        Value aS  = args[4];
+        Value aN  = args[5];
+
+        // --- Chan's parallel-variance combine formula ---
+        //   n      = aN + pn
+        //   d      = pm - aMu
+        //   newMu  = aMu + d * (pn / n)
+        //   newM2  = aS + ps + d * d * (aN * pn) / n
+        Value nNew   = arith::AddIOp::create(bb, lLoc, aN, pn);
+        Value nF     = arith::SIToFPOp::create(bb, lLoc, fpTy, nNew);
+        Value pnF    = arith::SIToFPOp::create(bb, lLoc, fpTy, pn);
+        Value aNF    = arith::SIToFPOp::create(bb, lLoc, fpTy, aN);
+
+        Value d      = arith::SubFOp::create(bb, lLoc, pm, aMu);
+        Value ratio  = arith::DivFOp::create(bb, lLoc, pnF, nF);
+        Value update = arith::MulFOp::create(bb, lLoc, d, ratio);
+        Value muNew  = arith::AddFOp::create(bb, lLoc, aMu, update);
+
+        Value prod   = arith::MulFOp::create(bb, lLoc, aNF, pnF);
+        Value ratio2 = arith::DivFOp::create(bb, lLoc, prod, nF);
+        Value d2     = arith::MulFOp::create(bb, lLoc, d, d);
+        Value term   = arith::MulFOp::create(bb, lLoc, d2, ratio2);
+        Value sum    = arith::AddFOp::create(bb, lLoc, aS, ps);
+        Value sNew   = arith::AddFOp::create(bb, lLoc, sum, term);
+
+        linalg::YieldOp::create(bb, lLoc,
+                                ValueRange{muNew, sNew, nNew});
+      });
+
+  return MergeResult{
+      {genericOp.getOperation()},
+      {genericOp.getResult(0),
+       genericOp.getResult(1),
+       genericOp.getResult(2)}};
+}
+
+//===----------------------------------------------------------------------===//
 // ExpReductionOp
 //===----------------------------------------------------------------------===//
 
