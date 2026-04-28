@@ -965,6 +965,10 @@ def IREELinalgExt_ArgCompareOp : IREELinalgExt_Op<"arg_compare", [
 def IREELinalgExt_WelfordVarianceOp : IREELinalgExt_Op<"welford_variance", [
     DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface,
         ["reifyResultShapes"]>,
+        DeclareOpInterfaceMethods<LinalgFusionInterface,
+   ["getIndexingMapsForResults", "getIndexingMapsForOperands",
+    "getStaticLoopRanges"]>,
+    DeclareOpInterfaceMethods<IndexingMapOpInterface, ["getMatchingIndexingMap"]>,
     DeclareOpInterfaceMethods<TilingInterface,
         ["generateScalarImplementation",
          "getIterationDomain",
@@ -1062,6 +1066,7 @@ def IREELinalgExt_WelfordVarianceOp : IREELinalgExt_Op<"welford_variance", [
     int64_t getNumParallelDims()  {
       return getInputRank() - getNumReductionDims();
     }
+    SmallVector<AffineMap> getIndexingMapsArray();
   }];
 }
 

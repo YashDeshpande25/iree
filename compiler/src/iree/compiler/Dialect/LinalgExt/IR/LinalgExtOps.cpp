@@ -1642,23 +1642,22 @@ MutableOperandRange ArgCompareOp::getDpsInitsMutable() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult WelfordVarianceOp::verify() {
-  Operation *op = getOperation();
 
   // --- (1) dimensions attribute sanity ---------------------------------
   ArrayRef<int64_t> dims = getDimensions();
   int64_t inputRank = getInputRank();
 
   if (dims.empty()) {
-    return op->emitOpError("expected at least one reduction dimension");
+    return emitOpError("expected at least one reduction dimension");
   }
   llvm::SmallDenseSet<int64_t> seen;
   for (int64_t d : dims) {
     if (d < 0 || d >= inputRank) {
-      return op->emitOpError("reduction dimension ")
+      return emitOpError("reduction dimension ")
              << d << " is out of range [0, " << inputRank << ")";
     }
     if (!seen.insert(d).second) {
-      return op->emitOpError("reduction dimension ")
+      return emitOpError("reduction dimension ")
              << d << " appears more than once";
     }
   }
@@ -1670,19 +1669,19 @@ LogicalResult WelfordVarianceOp::verify() {
   Type countElem  = getCountType().getElementType();
 
   if (!isa<FloatType>(inputElem)) {
-    return op->emitOpError("input element type must be floating-point, got ")
+    return emitOpError("input element type must be floating-point, got ")
            << inputElem;
   }
   if (meanElem != inputElem) {
-    return op->emitOpError("mean_init element type (")
+    return emitOpError("mean_init element type (")
            << meanElem << ") must match input element type (" << inputElem << ")";
   }
   if (m2Elem != inputElem) {
-    return op->emitOpError("m2_init element type (")
+    return emitOpError("m2_init element type (")
            << m2Elem << ") must match input element type";
   }
   if (!isa<IntegerType, IndexType>(countElem)) {
-    return op->emitOpError("count_init element type must be integer or index, got ")
+    return emitOpError("count_init element type must be integer or index, got ")
            << countElem;
   }
 
@@ -1690,7 +1689,7 @@ LogicalResult WelfordVarianceOp::verify() {
   ArrayRef<int64_t> meanShape  = getMeanType().getShape();
   if (getM2Type().getShape()    != meanShape ||
       getCountType().getShape() != meanShape) {
-    return op->emitOpError(
+    return emitOpError(
         "mean_init, m2_init, and count_init must have the same shape");
   }
 
@@ -1703,20 +1702,23 @@ LogicalResult WelfordVarianceOp::verify() {
       expected.push_back(inputShape[i]);
   }
   if (meanShape != ArrayRef<int64_t>(expected)) {
-    return op->emitOpError("expected init shape ")
+    return emitOpError("expected init shape ")
            << expected << ", but got " << meanShape;
   }
 
   // --- (5) result count and types tie to inits --------------------------
   if (getNumResults() != 0) {
     if (getNumResults() != 3) {
-      return op->emitOpError("expected 0 or 3 results, got ")
+      return emitOpError("expected 3 results, got ")
              << getNumResults();
     }
-    if (getResults()[0].getType() != getMeanInit().getType() ||
-        getResults()[1].getType() != getM2Init().getType()  ||
-        getResults()[2].getType() != getCountInit().getType()) {
-      return op->emitOpError("result types must match destination types");
+    if (failed(verifyCompatibleShape(getResults()[0].getType(),
+                                     getMeanInit().getType())) ||
+        failed(verifyCompatibleShape(getResults()[1].getType(),
+                                     getM2Init().getType()))   ||
+        failed(verifyCompatibleShape(getResults()[2].getType(),
+                                     getCountInit().getType()))) {
+      return emitOpError("result types must match destination types");
     }
   }
 
@@ -1733,6 +1735,83 @@ MutableOperandRange WelfordVarianceOp::getDpsInitsMutable() {
   // Operand layout: [input, mean_init, m2_init, count_init]
   // Inits occupy positions 1..3 inclusive, length 3.
   return MutableOperandRange(getOperation(), /*start=*/1, /*length=*/3);
+}
+
+//===----------------------------------------------------------------------===//
+// WelfordVarianceOp -- LinalgFusionInterface
+//===----------------------------------------------------------------------===//
+
+// Builds the master list of affine indexing maps:
+//   [input_map, mean_init_map, m2_init_map, count_init_map]
+// Init maps double as the corresponding result maps (DPS), so this same
+// list also describes how the three results index the iteration space.
+SmallVector<AffineMap> WelfordVarianceOp::getIndexingMapsArray() {
+  MLIRContext *ctx = getContext();
+  Builder b(ctx);
+
+  const int64_t rank = getInputRank();
+
+  // (a) Input map: identity over the iteration domain.
+  //     For input rank N: (d0, ..., dN-1) -> (d0, ..., dN-1)
+  AffineMap inputMap = b.getMultiDimIdentityMap(rank);
+
+  // (b) Init/result map: drop the reduction dims; keep the parallel ones.
+  //     Example, rank=2 with dimensions=[1]:   (d0, d1) -> (d0)
+  //     Example, rank=3 with dimensions=[1,2]: (d0, d1, d2) -> (d0)
+  llvm::SmallDenseSet<int64_t> reductionDimSet;
+  for (int64_t d : getDimensions()) {
+    reductionDimSet.insert(d);
+  }
+
+  SmallVector<AffineExpr> projected;
+  for (int64_t i = 0; i < rank; ++i) {
+    if (reductionDimSet.contains(i)) {
+      continue;
+    }
+    projected.push_back(getAffineDimExpr(i, ctx));
+  }
+  AffineMap initMap =
+      AffineMap::get(rank, /*symbolCount=*/0, projected, ctx);
+
+  // Layout: [input, mean_init, m2_init, count_init]
+  // The three init maps are identical in DPS; they also serve as the
+  // three result maps (mean, m2, count).
+  return {inputMap, initMap, initMap, initMap};
+}
+
+SmallVector<AffineMap> WelfordVarianceOp::getIndexingMapsForOperands() {
+  // First (numInputs + numInits) entries cover every DPS operand.
+  // For Welford that is 1 + 3 = 4 -- same as the array size, so this is
+  // effectively a copy. The resize is kept for parity with ArgCompareOp,
+  // in case the op ever gains non-DPS operands later.
+  SmallVector<AffineMap> maps = getIndexingMapsArray();
+  maps.resize(getNumDpsInputs() + getNumDpsInits());
+  return maps;
+}
+
+SmallVector<AffineMap> WelfordVarianceOp::getIndexingMapsForResults() {
+  // Drop the input maps from the front; what remains is one map per result
+  // (mean, m2, count) -- which is just the three init maps.
+  return llvm::to_vector_of<AffineMap>(
+      llvm::drop_begin(getIndexingMapsArray(), getNumDpsInputs()));
+}
+
+SmallVector<int64_t> WelfordVarianceOp::getStaticLoopRanges() {
+  // Loop bounds == input shape (since the input is the operand whose
+  // identity map covers the full iteration domain).
+  return llvm::to_vector(getInputShape());
+}
+
+ArrayAttr IREE::LinalgExt::WelfordVarianceOp::getIndexingMaps() {
+  SmallVector<AffineMap> maps = getIndexingMapsArray();
+  return Builder(getContext()).getAffineMapArrayAttr(maps);
+}
+
+AffineMap WelfordVarianceOp::getMatchingIndexingMap(OpOperand *operand) {
+  SmallVector<AffineMap> maps = getIndexingMapsArray();
+  unsigned idx = operand->getOperandNumber();
+  assert(idx < maps.size() && "operand has no indexing map");
+  return maps[idx];
 }
 
 //===----------------------------------------------------------------------===//

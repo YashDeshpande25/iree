@@ -1132,6 +1132,44 @@ module attributes { transform.with_named_sequence } {
 
 // -----
 
+func.func @welford_variance_tile_parallel(
+    %input: tensor<?x?xf32>,
+    %mean_init: tensor<?xf32>,
+    %m2_init: tensor<?xf32>,
+    %count_init: tensor<?xi64>)
+    -> (tensor<?xf32>, tensor<?xf32>, tensor<?xi64>) {
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<?x?xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<?xf32>, tensor<?xf32>, tensor<?xi64>)
+      -> tensor<?xf32>, tensor<?xf32>, tensor<?xi64>
+  return %mean, %m2, %count : tensor<?xf32>, tensor<?xf32>, tensor<?xi64>
+}
+
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(
+      %module_op: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["iree_linalg_ext.welford_variance"]}
+         in %module_op : (!transform.any_op) -> !transform.any_op
+    // tile only the parallel dim (dim 0), not the reduction dim (dim 1)
+    %1, %loops = transform.structured.tile_using_for %0 tile_sizes [10, 0]
+         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+}
+
+// CHECK-LABEL: func.func @welford_variance_tile_parallel
+// CHECK:         scf.for %{{.+}} = %c0 to %{{.+}} step %c10
+// CHECK:           %[[TILE:.+]]:3 = iree_linalg_ext.welford_variance
+// CHECK-SAME:        dimensions = [1]
+// CHECK:           tensor.insert_slice %[[TILE]]#0
+// CHECK:           tensor.insert_slice %[[TILE]]#1
+// CHECK:           tensor.insert_slice %[[TILE]]#2
+// CHECK:           scf.yield
+
+// -----
+
 func.func @exp_reduction_tile_tensor(
     %S: tensor<?x?xf32>,
     %M: tensor<?xf32>,
@@ -3351,6 +3389,57 @@ module attributes { transform.with_named_sequence } {
     transform.yield
   }
 }
+
+// -----
+
+// Split-reduction: split the reduction dim (1) into partial tiles of size 128,
+// then merge via Chan's formula.
+func.func @welford_variance_split_reduction(
+    %input: tensor<4x1024xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xi64>) {
+  %mi = tensor.empty() : tensor<4xf32>
+  %si = tensor.empty() : tensor<4xf32>
+  %ni = tensor.empty() : tensor<4xi64>
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mi, %si, %ni : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+      -> tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+  return %mean, %m2, %count : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+}
+
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(
+      %module_op: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["iree_linalg_ext.welford_variance"]}
+         in %module_op : (!transform.any_op) -> !transform.any_op
+    %fills:3, %split, %merge:3, %forop =
+        transform.structured.tile_reduction_using_for %0
+            by tile_sizes = [0, 128]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op,
+                                   !transform.any_op, !transform.any_op,
+                                   !transform.any_op, !transform.any_op,
+                                   !transform.any_op, !transform.any_op)
+    transform.yield
+  }
+}
+
+// -- Expect a fill of the partial accumulators, a partial welford op in the
+// -- tile loop, and a merge that implements Chan's combine.
+// CHECK-LABEL: func.func @welford_variance_split_reduction
+// CHECK:         %[[PM:.+]] = linalg.fill {{.*}} outs(%{{.+}} : tensor<4x?xf32>)
+// CHECK:         %[[PS:.+]] = linalg.fill {{.*}} outs(%{{.+}} : tensor<4x?xf32>)
+// CHECK:         %[[PN:.+]] = linalg.fill {{.*}} outs(%{{.+}} : tensor<4x?xi64>)
+// CHECK:         %[[LOOP:.+]]:3 = scf.for %{{.+}} = %c0 to %c1024 step %c128
+// CHECK:           iree_linalg_ext.welford_variance
+// CHECK-SAME:        dimensions = [1]
+// CHECK:         }
+// CHECK:         linalg.generic
+// CHECK-SAME:      iterator_types = ["parallel", "reduction"]
+// CHECK:           arith.addi
+// CHECK:           arith.subf
+// CHECK:           arith.addf
+// CHECK:           arith.mulf
+// CHECK:         return
 
 // -----
 

@@ -1113,6 +1113,179 @@ func.func @arg_compare_explicit_index(
 
 // -----
 
+func.func @welford_variance_static(
+    %input : tensor<4x1024xf32>,
+    %mean_init : tensor<4xf32>,
+    %m2_init : tensor<4xf32>,
+    %count_init : tensor<4xi64>
+) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xi64>) {
+  %0:3 = iree_linalg_ext.welford_variance
+    dimensions = [1]
+    ins(%input : tensor<4x1024xf32>)
+    outs(%mean_init, %m2_init, %count_init
+         : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+    -> tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+  return %0#0, %0#1, %0#2
+    : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+}
+
+// CHECK-LABEL: func.func @welford_variance_static(
+// CHECK-SAME:   %[[INPUT:[a-zA-Z0-9_]+]]: tensor<4x1024xf32>
+// CHECK-SAME:   %[[MEAN_INIT:[a-zA-Z0-9_]+]]: tensor<4xf32>
+// CHECK-SAME:   %[[M2_INIT:[a-zA-Z0-9_]+]]: tensor<4xf32>
+// CHECK-SAME:   %[[CNT_INIT:[a-zA-Z0-9_]+]]: tensor<4xi64>
+// CHECK:   %[[RESULT:.+]]:3 = iree_linalg_ext.welford_variance
+// CHECK-SAME:     dimensions = [1]
+// CHECK-SAME:     ins(%[[INPUT]] : tensor<4x1024xf32>)
+// CHECK-SAME:     outs(%[[MEAN_INIT]], %[[M2_INIT]], %[[CNT_INIT]]
+// CHECK-SAME:       : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+// CHECK:   return %[[RESULT]]#0, %[[RESULT]]#1, %[[RESULT]]#2 : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+
+// -----
+
+func.func @welford_variance_dynamic(
+    %input : tensor<?x?xf32>,
+    %mean_init : tensor<?xf32>,
+    %m2_init : tensor<?xf32>,
+    %count_init : tensor<?xi64>
+) -> (tensor<?xf32>, tensor<?xf32>, tensor<?xi64>) {
+  %0:3 = iree_linalg_ext.welford_variance
+    dimensions = [1]
+    ins(%input : tensor<?x?xf32>)
+    outs(%mean_init, %m2_init, %count_init
+         : tensor<?xf32>, tensor<?xf32>, tensor<?xi64>)
+    -> tensor<?xf32>, tensor<?xf32>, tensor<?xi64>
+  return %0#0, %0#1, %0#2
+    : tensor<?xf32>, tensor<?xf32>, tensor<?xi64>
+}
+
+// CHECK-LABEL: func.func @welford_variance_dynamic(
+// CHECK-SAME:   %[[INPUT:[a-zA-Z0-9_]+]]: tensor<?x?xf32>
+// CHECK-SAME:   %[[MEAN_INIT:[a-zA-Z0-9_]+]]: tensor<?xf32>
+// CHECK-SAME:   %[[M2_INIT:[a-zA-Z0-9_]+]]: tensor<?xf32>
+// CHECK-SAME:   %[[CNT_INIT:[a-zA-Z0-9_]+]]: tensor<?xi64>
+// CHECK:   %[[RESULT:.+]]:3 = iree_linalg_ext.welford_variance
+// CHECK-SAME:     dimensions = [1]
+// CHECK-SAME:     ins(%[[INPUT]] : tensor<?x?xf32>)
+// CHECK-SAME:     outs(%[[MEAN_INIT]], %[[M2_INIT]], %[[CNT_INIT]]
+// CHECK-SAME:       : tensor<?xf32>, tensor<?xf32>, tensor<?xi64>)
+// CHECK:   return %[[RESULT]]#0, %[[RESULT]]#1, %[[RESULT]]#2 : tensor<?xf32>, tensor<?xf32>, tensor<?xi64>
+
+// -----
+
+func.func @welford_variance_static_memref(
+    %input : memref<4x1024xf32>,
+    %mean : memref<4xf32>,
+    %m2 : memref<4xf32>,
+    %count : memref<4xi64>
+) {
+  iree_linalg_ext.welford_variance
+    dimensions = [1]
+    ins(%input : memref<4x1024xf32>)
+    outs(%mean, %m2, %count
+         : memref<4xf32>, memref<4xf32>, memref<4xi64>)
+  return
+}
+
+// CHECK-LABEL: func.func @welford_variance_static_memref(
+// CHECK-SAME:   %[[INPUT:[a-zA-Z0-9_]+]]: memref<4x1024xf32>
+// CHECK-SAME:   %[[MEAN:[a-zA-Z0-9_]+]]: memref<4xf32>
+// CHECK-SAME:   %[[M2:[a-zA-Z0-9_]+]]: memref<4xf32>
+// CHECK-SAME:   %[[CNT:[a-zA-Z0-9_]+]]: memref<4xi64>
+// CHECK:   iree_linalg_ext.welford_variance
+// CHECK-SAME:     dimensions = [1]
+// CHECK-SAME:     ins(%[[INPUT]] : memref<4x1024xf32>)
+// CHECK-SAME:     outs(%[[MEAN]], %[[M2]], %[[CNT]]
+// CHECK-SAME:       : memref<4xf32>, memref<4xf32>, memref<4xi64>)
+
+// -----
+
+func.func @welford_variance_dynamic_memref(
+    %input : memref<?x?xf32>,
+    %mean : memref<?xf32>,
+    %m2 : memref<?xf32>,
+    %count : memref<?xi64>
+) {
+  iree_linalg_ext.welford_variance
+    dimensions = [1]
+    ins(%input : memref<?x?xf32>)
+    outs(%mean, %m2, %count
+         : memref<?xf32>, memref<?xf32>, memref<?xi64>)
+  return
+}
+
+// CHECK-LABEL: func.func @welford_variance_dynamic_memref(
+// CHECK-SAME:   %[[INPUT:[a-zA-Z0-9_]+]]: memref<?x?xf32>
+// CHECK-SAME:   %[[MEAN:[a-zA-Z0-9_]+]]: memref<?xf32>
+// CHECK-SAME:   %[[M2:[a-zA-Z0-9_]+]]: memref<?xf32>
+// CHECK-SAME:   %[[CNT:[a-zA-Z0-9_]+]]: memref<?xi64>
+// CHECK:   iree_linalg_ext.welford_variance
+// CHECK-SAME:     dimensions = [1]
+// CHECK-SAME:     ins(%[[INPUT]] : memref<?x?xf32>)
+// CHECK-SAME:     outs(%[[MEAN]], %[[M2]], %[[CNT]]
+// CHECK-SAME:       : memref<?xf32>, memref<?xf32>, memref<?xi64>)
+
+// -----
+
+func.func @welford_variance_multi_reduction_dims(
+    %input : tensor<4x8x16xf32>,
+    %mean_init : tensor<4xf32>,
+    %m2_init : tensor<4xf32>,
+    %count_init : tensor<4xi64>
+) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xi64>) {
+  %0:3 = iree_linalg_ext.welford_variance
+    dimensions = [1, 2]
+    ins(%input : tensor<4x8x16xf32>)
+    outs(%mean_init, %m2_init, %count_init
+         : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+    -> tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+  return %0#0, %0#1, %0#2
+    : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+}
+// CHECK-LABEL: func.func @welford_variance_multi_reduction_dims(
+// CHECK-SAME:   %[[INPUT:[a-zA-Z0-9_]+]]: tensor<4x8x16xf32>
+// CHECK-SAME:   %[[MEAN_INIT:[a-zA-Z0-9_]+]]: tensor<4xf32>
+// CHECK-SAME:   %[[M2_INIT:[a-zA-Z0-9_]+]]: tensor<4xf32>
+// CHECK-SAME:   %[[CNT_INIT:[a-zA-Z0-9_]+]]: tensor<4xi64>
+// CHECK:   %[[RESULT:.+]]:3 = iree_linalg_ext.welford_variance
+// CHECK-SAME:     dimensions = [1, 2]
+// CHECK-SAME:     ins(%[[INPUT]] : tensor<4x8x16xf32>)
+// CHECK-SAME:     outs(%[[MEAN_INIT]], %[[M2_INIT]], %[[CNT_INIT]]
+// CHECK-SAME:       : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+// CHECK:   return %[[RESULT]]#0, %[[RESULT]]#1, %[[RESULT]]#2 : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+
+// -----
+
+func.func @welford_variance_outer_reduction_dim(
+    %input : tensor<1024x4xf32>,
+    %mean_init : tensor<4xf32>,
+    %m2_init : tensor<4xf32>,
+    %count_init : tensor<4xi64>
+) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xi64>) {
+  %0:3 = iree_linalg_ext.welford_variance
+    dimensions = [0]
+    ins(%input : tensor<1024x4xf32>)
+    outs(%mean_init, %m2_init, %count_init
+         : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+    -> tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+  return %0#0, %0#1, %0#2
+    : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+}
+
+// CHECK-LABEL: func.func @welford_variance_outer_reduction_dim(
+// CHECK-SAME:   %[[INPUT:[a-zA-Z0-9_]+]]: tensor<1024x4xf32>
+// CHECK-SAME:   %[[MEAN_INIT:[a-zA-Z0-9_]+]]: tensor<4xf32>
+// CHECK-SAME:   %[[M2_INIT:[a-zA-Z0-9_]+]]: tensor<4xf32>
+// CHECK-SAME:   %[[CNT_INIT:[a-zA-Z0-9_]+]]: tensor<4xi64>
+// CHECK:   %[[RESULT:.+]]:3 = iree_linalg_ext.welford_variance
+// CHECK-SAME:     dimensions = [0]
+// CHECK-SAME:     ins(%[[INPUT]] : tensor<1024x4xf32>)
+// CHECK-SAME:     outs(%[[MEAN_INIT]], %[[M2_INIT]], %[[CNT_INIT]]
+// CHECK-SAME:       : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+// CHECK:   return %[[RESULT]]#0, %[[RESULT]]#1, %[[RESULT]]#2 : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+
+// -----
+
 func.func @fft_tensor(%arg0: tensor<1024xf32>, %arg1: tensor<1024xf32>)
     -> (tensor<1024xf32>, tensor<1024xf32>) {
   %cst1 = arith.constant 1 : index

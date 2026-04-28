@@ -1275,6 +1275,42 @@ func.func @arg_compare_explicit_index_memref_dynamic(
 
 // -----
 
+func.func @welford_variance_loops(%input: memref<4x1024xf32>,
+                                  %mean:  memref<4xf32>,
+                                  %m2:    memref<4xf32>,
+                                  %count: memref<4xi64>) {
+  iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : memref<4x1024xf32>)
+      outs(%mean, %m2, %count : memref<4xf32>, memref<4xf32>, memref<4xi64>)
+  return
+}
+// CHECK-LABEL: func.func @welford_variance_loops
+// CHECK-SAME:    %[[IN:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[M:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[S:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[N:[a-zA-Z0-9]+]]
+// Outer parallel loop (dim 0)
+// CHECK:         scf.for %[[I:.+]] = %c0 to %c4 step %c1
+// Inner reduction loop (dim 1)
+// CHECK:           scf.for %[[J:.+]] = %c0 to %c1024 step %c1
+// CHECK-DAG:         %[[X:.+]]    = memref.load %[[IN]][%[[I]], %[[J]]]
+// CHECK-DAG:         %[[OLD_M:.+]]  = memref.load %[[M]][%[[I]]]
+// CHECK-DAG:         %[[OLD_S:.+]]  = memref.load %[[S]][%[[I]]]
+// CHECK-DAG:         %[[OLD_N:.+]]  = memref.load %[[N]][%[[I]]]
+// CHECK:             %[[NEW_N:.+]]  = arith.addi %[[OLD_N]], %{{.+}}
+// CHECK:             %[[DELTA:.+]]  = arith.subf %[[X]], %[[OLD_M]]
+// CHECK:             %[[QUOT:.+]]   = arith.divf %[[DELTA]]
+// CHECK:             %[[NEW_M:.+]]  = arith.addf %[[OLD_M]], %[[QUOT]]
+// CHECK:             %[[DELTA2:.+]] = arith.subf %[[X]], %[[NEW_M]]
+// CHECK:             %[[PROD:.+]]   = arith.mulf %[[DELTA]], %[[DELTA2]]
+// CHECK:             %[[NEW_S:.+]]  = arith.addf %[[OLD_S]], %[[PROD]]
+// CHECK:             memref.store %[[NEW_M]], %[[M]]
+// CHECK:             memref.store %[[NEW_S]], %[[S]]
+// CHECK:             memref.store %[[NEW_N]], %[[N]]
+
+// -----
+
 func.func @gather_1d_indices(%arg0 : memref<10x10xi32>, %arg1 : memref<1xi32>, %arg2 : memref<1x10xi32>) {
   iree_linalg_ext.gather
     dimension_map = [0]

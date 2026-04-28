@@ -934,6 +934,215 @@ func.func @arg_compare_invalid_explicit_index_with_base(
 
 // -----
 
+// (1a) Empty reduction dimensions list.
+func.func @welford_empty_dimensions(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4x1024xf32>,
+    %m2_init: tensor<4x1024xf32>,
+    %count_init: tensor<4x1024xi64>)
+    -> (tensor<4x1024xf32>, tensor<4x1024xf32>, tensor<4x1024xi64>) {
+  // expected-error @+1 {{expected at least one reduction dimension}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = []
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4x1024xf32>, tensor<4x1024xf32>, tensor<4x1024xi64>)
+      -> tensor<4x1024xf32>, tensor<4x1024xf32>, tensor<4x1024xi64>
+  return %mean, %m2, %count
+      : tensor<4x1024xf32>, tensor<4x1024xf32>, tensor<4x1024xi64>
+}
+
+// -----
+
+// (1b) Reduction dimension out of range.
+func.func @welford_dim_out_of_range(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4xf32>,
+    %m2_init: tensor<4xf32>,
+    %count_init: tensor<4xi64>)
+    -> (tensor<4xf32>, tensor<4xf32>, tensor<4xi64>) {
+  // expected-error @+1 {{reduction dimension 5 is out of range}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [5]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+      -> tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+  return %mean, %m2, %count : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+}
+
+// -----
+
+// (1c) Duplicate reduction dimension.
+func.func @welford_duplicate_dim(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4xf32>,
+    %m2_init: tensor<4xf32>,
+    %count_init: tensor<4xi64>)
+    -> (tensor<4xf32>, tensor<4xf32>, tensor<4xi64>) {
+  // expected-error @+1 {{reduction dimension 1 appears more than once}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1, 1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+      -> tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+  return %mean, %m2, %count : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>
+}
+
+// -----
+
+// (2a) Input must be a floating-point type.
+func.func @welford_int_input(
+    %input: tensor<4x1024xi32>,
+    %mean_init: tensor<4xi32>,
+    %m2_init: tensor<4xi32>,
+    %count_init: tensor<4xi64>)
+    -> (tensor<4xi32>, tensor<4xi32>, tensor<4xi64>) {
+  // expected-error @+1 {{input element type must be floating-point}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xi32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xi32>, tensor<4xi32>, tensor<4xi64>)
+      -> tensor<4xi32>, tensor<4xi32>, tensor<4xi64>
+  return %mean, %m2, %count : tensor<4xi32>, tensor<4xi32>, tensor<4xi64>
+}
+
+// -----
+
+// (2b) mean_init element type must match input element type.
+func.func @welford_mean_elem_mismatch(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4xf16>,
+    %m2_init: tensor<4xf32>,
+    %count_init: tensor<4xi64>)
+    -> (tensor<4xf16>, tensor<4xf32>, tensor<4xi64>) {
+  // expected-error @+1 {{mean_init element type}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xf16>, tensor<4xf32>, tensor<4xi64>)
+      -> tensor<4xf16>, tensor<4xf32>, tensor<4xi64>
+  return %mean, %m2, %count : tensor<4xf16>, tensor<4xf32>, tensor<4xi64>
+}
+
+// -----
+
+// (2c) m2_init element type must match input element type.
+func.func @welford_m2_elem_mismatch(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4xf32>,
+    %m2_init: tensor<4xf16>,
+    %count_init: tensor<4xi64>)
+    -> (tensor<4xf32>, tensor<4xf16>, tensor<4xi64>) {
+  // expected-error @+1 {{m2_init element type}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xf32>, tensor<4xf16>, tensor<4xi64>)
+      -> tensor<4xf32>, tensor<4xf16>, tensor<4xi64>
+  return %mean, %m2, %count : tensor<4xf32>, tensor<4xf16>, tensor<4xi64>
+}
+
+// -----
+
+// (2d) count_init element type must be integer or index.
+func.func @welford_float_count(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4xf32>,
+    %m2_init: tensor<4xf32>,
+    %count_init: tensor<4xf32>)
+    -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+  // expected-error @+1 {{count_init element type must be integer or index}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
+      -> tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+  return %mean, %m2, %count : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+}
+
+// -----
+
+// (3) mean_init, m2_init, count_init must share the same shape.
+func.func @welford_init_shape_mismatch(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4xf32>,
+    %m2_init: tensor<8xf32>,
+    %count_init: tensor<4xi64>)
+    -> (tensor<4xf32>, tensor<8xf32>, tensor<4xi64>) {
+  // expected-error @+1 {{must have the same shape}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xf32>, tensor<8xf32>, tensor<4xi64>)
+      -> tensor<4xf32>, tensor<8xf32>, tensor<4xi64>
+  return %mean, %m2, %count : tensor<4xf32>, tensor<8xf32>, tensor<4xi64>
+}
+
+// -----
+
+// (4) Init shape must equal input shape minus reduction dims.
+func.func @welford_wrong_init_shape(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<8xf32>,
+    %m2_init: tensor<8xf32>,
+    %count_init: tensor<8xi64>)
+    -> (tensor<8xf32>, tensor<8xf32>, tensor<8xi64>) {
+  // expected-error @+1 {{expected init shape}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<8xf32>, tensor<8xf32>, tensor<8xi64>)
+      -> tensor<8xf32>, tensor<8xf32>, tensor<8xi64>
+  return %mean, %m2, %count : tensor<8xf32>, tensor<8xf32>, tensor<8xi64>
+}
+
+// -----
+
+// (5a) Must have 3 results; 2 is illegal.
+func.func @welford_wrong_num_results(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4xf32>,
+    %m2_init: tensor<4xf32>,
+    %count_init: tensor<4xi64>) -> (tensor<4xf32>, tensor<4xf32>) {
+  // expected-error @+1 {{expected 3 results}}
+  %mean, %m2 = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+      -> tensor<4xf32>, tensor<4xf32>
+  return %mean, %m2 : tensor<4xf32>, tensor<4xf32>
+}
+
+// -----
+
+// (5b) Result types must match their destination types.
+func.func @welford_result_type_mismatch(
+    %input: tensor<4x1024xf32>,
+    %mean_init: tensor<4xf32>,
+    %m2_init: tensor<4xf32>,
+    %count_init: tensor<4xi64>)
+    -> (tensor<4xf32>, tensor<4xf32>, tensor<4xi32>) {
+  // expected-error @+1 {{result types must match destination types}}
+  %mean, %m2, %count = iree_linalg_ext.welford_variance
+      dimensions = [1]
+      ins(%input : tensor<4x1024xf32>)
+      outs(%mean_init, %m2_init, %count_init
+           : tensor<4xf32>, tensor<4xf32>, tensor<4xi64>)
+      -> tensor<4xf32>, tensor<4xf32>, tensor<4xi32>
+  return %mean, %m2, %count : tensor<4xf32>, tensor<4xf32>, tensor<4xi32>
+}
+
+// -----
+
 func.func @topk_invalid(%input_values: tensor<2x10xi32>, %input_indices: tensor<2x10xi32>, %out_values : tensor<2x3xf32>, %out_indices: tensor<2x3xi32>) -> (tensor<2x3xf32>, tensor<2x3xi32>) {
    // expected-error@+1 {{expected input/output value types to be identical}}
   %0:2 = iree_linalg_ext.topk
