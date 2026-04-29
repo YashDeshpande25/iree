@@ -79,10 +79,10 @@ static std::optional<SmallVector<int64_t>>
 getOuterReductionSizes(PartialReductionOpInterface op,
                        int64_t splitReductionTargetSize) {
   SmallVector<utils::IteratorType> iters = op.getLoopIteratorTypes();
-  if (iters.empty() || iters.front() != utils::IteratorType::reduction) {
-    LDBG() << "skipping op; not outer-reduction";
-    return std::nullopt;
-  }
+  // if (iters.empty() || iters.front() != utils::IteratorType::reduction) {
+  //   LDBG() << "skipping op; not outer-reduction";
+  //   return std::nullopt;
+  // }
 
   std::optional<SmallVector<int64_t>> maybeSizes =
       getReductionDimSizes(op.getOperation());

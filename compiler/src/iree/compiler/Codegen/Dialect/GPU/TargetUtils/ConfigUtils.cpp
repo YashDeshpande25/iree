@@ -1326,6 +1326,17 @@ static FailureOr<DistributionInfo> collectOpDistributionInfo(Operation *op) {
     return distInfo;
   }
 
+  if (auto welfordOp = dyn_cast<IREE::LinalgExt::WelfordVarianceOp>(op)) {
+    distInfo.partitionableLoops =
+        llvm::to_vector(llvm::seq<unsigned int>(welfordOp.getInputRank()));
+    distInfo.vectorizable = false;
+    distInfo.minBitwidth = welfordOp.getInputType().getElementTypeBitWidth();
+    distInfo.representativeBitWidth = distInfo.minBitwidth;
+    distInfo.loopBounds =
+        SmallVector<int64_t>(welfordOp.getInputType().getShape());
+    return distInfo;
+  }
+
   // PackOp doesn't fit the LinalgOp interface, since it is a RelayoutOp, so
   // we have to use special case logic to get the distribution info.
   if (auto packOp = dyn_cast<linalg::PackOp>(op)) {

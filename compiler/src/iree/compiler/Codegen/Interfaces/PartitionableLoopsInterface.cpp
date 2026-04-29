@@ -270,6 +270,8 @@ void registerPartitionableLoopsInterfaceModels(DialectRegistry &registry) {
 
   registry.addExtension(+[](MLIRContext *ctx,
                             IREE::LinalgExt::IREELinalgExtDialect *dialect) {
+    IREE::LinalgExt::WelfordVarianceOp::attachInterface<
+        AllParallelAsPartitionableLoops<IREE::LinalgExt::WelfordVarianceOp>>(*ctx);
     IREE::LinalgExt::ArgCompareOp::attachInterface<
         AllParallelAsPartitionableLoops<IREE::LinalgExt::ArgCompareOp>>(*ctx);
     IREE::LinalgExt::FftOp::attachInterface<FftOpPartitionableLoops>(*ctx);

@@ -1034,10 +1034,10 @@ struct HoistForallFromFor : OpRewritePattern<scf::ForOp> {
                                          "Loop only contains a terminator");
     }
 
-    if (loop.getNumResults() != 1) {
-      return rewriter.notifyMatchFailure(
-          loop, "unimplemented: multi-result hoisting");
-    }
+    // if (loop.getNumResults() != 1) {
+    //   return rewriter.notifyMatchFailure(
+    //       loop, "unimplemented: multi-result hoisting");
+    // }
 
     auto forallOp = dyn_cast<scf::ForallOp>(
         loop.getBody()->getTerminator()->getOperand(0).getDefiningOp());

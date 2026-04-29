@@ -1702,8 +1702,9 @@ LogicalResult WelfordVarianceOp::verify() {
       expected.push_back(inputShape[i]);
   }
   if (meanShape != ArrayRef<int64_t>(expected)) {
+    llvm :: dbgs() << llvm::interleaved_array(dims) << "\n";
     return emitOpError("expected init shape ")
-           << expected << ", but got " << meanShape;
+           << llvm::interleaved_array(expected) << ", but got " << llvm::interleaved_array(meanShape);
   }
 
   // --- (5) result count and types tie to inits --------------------------
@@ -1712,16 +1713,12 @@ LogicalResult WelfordVarianceOp::verify() {
       return emitOpError("expected 3 results, got ")
              << getNumResults();
     }
-    if (failed(verifyCompatibleShape(getResults()[0].getType(),
-                                     getMeanInit().getType())) ||
-        failed(verifyCompatibleShape(getResults()[1].getType(),
-                                     getM2Init().getType()))   ||
-        failed(verifyCompatibleShape(getResults()[2].getType(),
-                                     getCountInit().getType()))) {
+    if (getResults()[0].getType() != getMeanInit().getType() ||
+        getResults()[1].getType() != getM2Init().getType()  ||
+        getResults()[2].getType() != getCountInit().getType()) {
       return emitOpError("result types must match destination types");
     }
   }
-
   return success();
 }
 
