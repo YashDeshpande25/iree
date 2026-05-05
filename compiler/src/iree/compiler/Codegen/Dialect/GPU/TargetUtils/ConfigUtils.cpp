@@ -1327,8 +1327,21 @@ static FailureOr<DistributionInfo> collectOpDistributionInfo(Operation *op) {
   }
 
   if (auto welfordOp = dyn_cast<IREE::LinalgExt::WelfordVarianceOp>(op)) {
-    distInfo.partitionableLoops =
-        llvm::to_vector(llvm::seq<unsigned int>(welfordOp.getInputRank()));
+    // Only the parallel iteration dims (i.e. those NOT listed in `dimensions`)
+    // are partitionable. Distributing reduction dims across workgroups would
+    // make multiple workgroups write to the same output slot, which is unsafe
+    // for a full reduction.
+    llvm::SmallDenseSet<int64_t> reductionSet;
+    for (int64_t d : welfordOp.getDimensions()) {
+      reductionSet.insert(d);
+    }
+    SmallVector<unsigned int> parallelLoops;
+    for (int64_t d = 0, e = welfordOp.getInputRank(); d < e; ++d) {
+      if (!reductionSet.contains(d)) {
+        parallelLoops.push_back(static_cast<unsigned int>(d));
+      }
+    }
+    distInfo.partitionableLoops = std::move(parallelLoops);
     distInfo.vectorizable = false;
     distInfo.minBitwidth = welfordOp.getInputType().getElementTypeBitWidth();
     distInfo.representativeBitWidth = distInfo.minBitwidth;
@@ -1624,6 +1637,23 @@ LogicalResult setTileAndFuseLoweringConfig(IREE::GPU::TargetAttr target,
   if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
     SmallVector<utils::IteratorType> iterTypes =
         linalgOp.getIteratorTypesArray();
+    for (auto [reverseIdx, iter] : llvm::enumerate(llvm::reverse(iterTypes))) {
+      unsigned i = numLoops - reverseIdx - 1;
+      if (linalg::isReductionIterator(iter) || i >= workgroupTileSizes.size() ||
+          workgroupTileSizes[i] == 0) {
+        int64_t tileSize = getReductionTilingFactor(distInfo.loopBounds[i]);
+        if (vectorSize * tileSize > maxVectorSize) {
+          tileSize = 1;
+        }
+        vectorSize *= tileSize;
+        loopTileSizes[i] = tileSize;
+      }
+    }
+  }
+
+  if (auto welfordOp = dyn_cast<IREE::LinalgExt::WelfordVarianceOp>(op)) {
+    SmallVector<utils::IteratorType> iterTypes =
+        welfordOp.getLoopIteratorTypes();
     for (auto [reverseIdx, iter] : llvm::enumerate(llvm::reverse(iterTypes))) {
       unsigned i = numLoops - reverseIdx - 1;
       if (linalg::isReductionIterator(iter) || i >= workgroupTileSizes.size() ||
